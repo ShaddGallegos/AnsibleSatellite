@@ -1,0 +1,173 @@
+---
+- name: Configure mail server with SMTP and Gmail fallback
+  hosts: satellite
+  become: true
+  vars:
+    # Primary SMTP
+    smtp_host: "localhost"
+    smtp_port: 587
+    smtp_account: "admin@prod.spg"
+    smtp_account_password: "r3dh4t7!"
+    smtp_from_email_address: "admin@prod.spg"
+    smtp_to_email_addresses:
+      - "admin@prod.spg"
+
+    # Gmail fallback
+    gmail_smtp_host: "smtp.gmail.com"
+    gmail_smtp_port: 587
+    gmail_account: "yourgmail@gmail.com"
+    gmail_password: "your_app_password"  # Use Gmail App Password
+    gmail_from: "yourgmail@gmail.com"
+
+    # Email content
+    email_subject: "Satellite Report"
+    email_html_body: "<h1>Satellite Report</h1><p>This is an automated message.</p>"
+    email_text_body: "Satellite Report: This is an automated message."
+
+    # Report logic
+    report_file_enabled: false
+    report_file_formats: ["json"]
+    report_base_path: "/var/reports"
+    report_base_name: "satellite"
+    report_timestamp_formatted: "{{ lookup('pipe', 'date +%Y%m%d') }}"
+    report_email_enabled: true
+    send_email_with_smtp: true
+    report_storage_type: "email"
+    report_debug_mode: true
+
+  tasks:
+
+  - name: Install mail server packages
+    yum:
+      name:
+        - postfix
+        - mailx
+      state: present
+
+  - name: Enable and start postfix
+    service:
+      name: postfix
+      state: started
+      enabled: true
+
+  - name: Configure Postfix for SMTP relay
+    lineinfile:
+      path: /etc/postfix/main.cf
+      regexp: '^{{ item.key }}'
+      line: '{{ item.key }} = {{ item.value }}'
+    loop:
+      - { key: 'relayhost', value: '[smtp.prod.spg]:587' }
+      - { key: 'smtp_use_tls', value: 'yes' }
+      - { key: 'smtp_sasl_auth_enable', value: 'yes' }
+      - { key: 'smtp_sasl_password_maps', value: 'hash:/etc/postfix/sasl_passwd' }
+      - { key: 'smtp_sasl_security_options', value: 'noanonymous' }
+      - { key: 'smtp_sasl_tls_security_options', value: 'noanonymous' }
+
+  - name: Create SASL password file
+    copy:
+      dest: /etc/postfix/sasl_passwd
+      content: |
+        [smtp.prod.spg]:587 {{ smtp_account }}:{{ smtp_account_password }}
+      mode: '0600'
+
+  - name: Generate hash db for SASL password
+    command: postmap /etc/postfix/sasl_passwd
+
+  - name: Restart postfix to apply changes
+    service:
+      name: postfix
+      state: restarted
+
+  - name: Send email via SMTP
+    mail:
+      host: "{{ smtp_host }}"
+      port: "{{ smtp_port }}"
+      username: "{{ smtp_account }}"
+      password: "{{ smtp_account_password }}"
+      to: "{{ smtp_to_email_addresses }}"
+      from: "{{ smtp_from_email_address }}"
+      subject: "{{ email_subject }}"
+      body: "{{ email_html_body }}"
+      subtype: html
+      secure: "{{ smtp_use_tls | ternary('starttls', 'never') }}"
+      charset: utf-8
+      attach: >-
+        {%- if report_file_enabled and 'json' in report_file_formats -%}
+        {{ report_base_path }}/{{ report_base_name }}-fleet-summary-{{ report_timestamp_formatted }}.txt
+        {%- endif -%}
+    delegate_to: localhost
+    become: false
+    register: smtp_response
+    when:
+      - report_email_enabled | bool
+      - send_email_with_smtp | bool
+      - smtp_account is defined
+      - smtp_account_password is defined
+      - smtp_to_email_addresses | length > 0
+      - report_storage_type in ['email', 'all']
+    run_once: true
+
+  - name: Send email via Gmail SMTP (fallback)
+    mail:
+      host: "{{ gmail_smtp_host }}"
+      port: "{{ gmail_smtp_port }}"
+      username: "{{ gmail_account }}"
+      password: "{{ gmail_password }}"
+      to: "{{ smtp_to_email_addresses }}"
+      from: "{{ gmail_from }}"
+      subject: "{{ email_subject }}"
+      body: "{{ email_html_body }}"
+      subtype: html
+      secure: starttls
+      charset: utf-8
+    delegate_to: localhost
+    become: false
+    register: gmail_response
+    when:
+      - report_email_enabled | bool
+      - smtp_response is failed
+      - gmail_account is defined
+      - gmail_password is defined
+      - smtp_to_email_addresses | length > 0
+      - report_storage_type in ['email', 'all']
+    run_once: true
+
+  - name: Alternative SMTP with mail command (fallback)
+    shell: |
+      echo "{{ email_text_body }}" | mail -s "{{ email_subject }}" {% for email in smtp_to_email_addresses %}{{ email }} {% endfor %}
+    delegate_to: localhost
+    become: false
+    register: mail_cmd_response
+    when:
+      - report_email_enabled | bool
+      - not send_email_with_smtp | bool
+      - smtp_to_email_addresses | length > 0
+      - report_storage_type in ['email', 'all']
+      - smtp_response is not defined or smtp_response is failed
+      - gmail_response is not defined or gmail_response is failed
+    run_once: true
+
+  - name: Verify email delivery
+    debug:
+      msg: |
+        Email delivery status:
+        {% if smtp_response is defined and not smtp_response is failed %}
+        SMTP: Successfully sent to {{ smtp_to_email_addresses | length }} recipients
+        {% elif smtp_response is defined and smtp_response is failed %}
+        SMTP: Failed - {{ smtp_response.msg | default('Unknown error') }}
+        {% endif %}
+        {% if gmail_response is defined and not gmail_response is failed %}
+        Gmail SMTP: Successfully sent to {{ smtp_to_email_addresses | length }} recipients
+        {% elif gmail_response is defined and gmail_response is failed %}
+        Gmail SMTP: Failed - {{ gmail_response.msg | default('Unknown error') }}
+        {% endif %}
+        {% if mail_cmd_response is defined and not mail_cmd_response is failed %}
+        Mail Command: Successfully sent to {{ smtp_to_email_addresses | length }} recipients
+        {% elif mail_cmd_response is defined and mail_cmd_response is failed %}
+        Mail Command: Failed - {{ mail_cmd_response.stderr | default('Unknown error') }}
+        {% endif %}
+    when:
+      - report_email_enabled | bool
+      - report_debug_mode | bool
+    run_once: true
+

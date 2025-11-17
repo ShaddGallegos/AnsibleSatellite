@@ -1,0 +1,146 @@
+---
+- name: Provision node and register to Satellite
+  hosts: all
+  become: true
+  vars:
+    admin_user: admin
+    admin_password: r3dh4t7!
+    satellite_ip: 10.168.151.127
+    ca_rpm_url: "http://{{ satellite_ip }}/pub/katello-ca-consumer-satellite.prod.spg-1.0-1.noarch.rpm"
+    bootstrap_url: "http://{{ satellite_ip }}/pub/bootstrap.py"
+    repo_name: satellite-client-6-for-rhel-9-x86_64-rpms
+    activation_keys:
+      "8": RHEL8-AK
+      "9": RHEL9-AK
+      "10": RHEL10-AK
+
+  tasks:
+
+  - name: Create admin user
+    user:
+      name: "{{ admin_user }}"
+      password: "{{ admin_password | password_hash('sha512') }}"
+      groups: wheel
+      append: yes
+      shell: /bin/bash
+      update_password: on_create
+      state: present
+
+  - name: Force password change on first login
+    command: chage -d 0 "{{ admin_user }}"
+
+  - name: Add admin to sudoers
+    lineinfile:
+      path: /etc/sudoers
+      state: present
+      regexp: '^{{ admin_user }}'
+      line: '{{ admin_user }} ALL=(ALL) NOPASSWD: ALL'
+      validate: '/usr/sbin/visudo -cf %s'
+
+  - name: Generate SSH key for admin
+    become_user: "{{ admin_user }}"
+    command: ssh-keygen -t rsa -N "" -f ~/.ssh/id_rsa
+    args:
+      creates: "/home/{{ admin_user }}/.ssh/id_rsa"
+
+  - name: Copy SSH key to localhost
+    become_user: "{{ admin_user }}"
+    command: ssh-copy-id -i ~/.ssh/id_rsa.pub {{ admin_user }}@127.0.0.1
+    ignore_errors: true
+
+  - name: Get existing node names from Satellite
+    delegate_to: localhost
+    command: hammer host list --search "name ~ node" --fields name --per-page 1000
+    register: hammer_output
+
+  - name: Determine next available node name
+    set_fact:
+      next_node_name: "{{ lookup('pipe', 'python3 scripts/next_node.py \"' + hammer_output.stdout + '\"') }}"
+
+  - name: Set hostname
+    hostname:
+      name: "{{ next_node_name }}"
+
+  - name: Update /etc/hostname
+    lineinfile:
+      path: /etc/hostname
+      line: "{{ next_node_name }}"
+      create: yes
+
+  - name: Disable host key checking
+    lineinfile:
+      path: /etc/ssh/ssh_config
+      regexp: '^StrictHostKeyChecking'
+      line: 'StrictHostKeyChecking no'
+
+  - name: Enable PermitRootLogin
+    lineinfile:
+      path: /etc/ssh/sshd_config
+      regexp: '^PermitRootLogin'
+      line: 'PermitRootLogin yes'
+
+  - name: Restart SSHD
+    service:
+      name: sshd
+      state: restarted
+
+  - name: Configure firewall for Satellite services
+    firewalld:
+      service: "{{ item }}"
+      permanent: true
+      state: enabled
+    loop:
+      - ssh
+      - http
+      - https
+      - tftp
+      - dhcp
+      - dns
+      - rhc
+      - insights-client
+
+  - name: Reload firewalld
+    service:
+      name: firewalld
+      state: reloaded
+
+  - name: Install Katello CA RPM
+    yum:
+      name: "{{ ca_rpm_url }}"
+      state: present
+
+  - name: Run bootstrap script
+    get_url:
+      url: "{{ bootstrap_url }}"
+      dest: /tmp/bootstrap.py
+      mode: '0755'
+
+  - name: Execute bootstrap
+    command: python3 /tmp/bootstrap.py
+
+  - name: Enable Satellite repo
+    rhsm_repository:
+      name: "{{ repo_name }}"
+      state: enabled
+
+  - name: Install required packages
+    yum:
+      name:
+        - katello-agent
+        - katello-host-tools
+        - katello-host-tools-tracer
+        - puppet-agent
+        - gofer
+        - python3-gofer
+        - python3-gofer-proton
+        - qpid-proton-c
+        - insights-client
+        - rhc
+      state: present
+
+  - name: Register with Insights
+    command: insights-client --register
+
+  - name: Connect to RHC
+    command: rhc connect --organization 1 --activation-key "{{ activation_keys[ansible_distribution_major_version] }}"
+
