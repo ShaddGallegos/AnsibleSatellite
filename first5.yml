@@ -6,6 +6,8 @@
     node_prefix: "node"
     total_nodes: 5
     delay_seconds: 30
+    # Satellite-driven discovery: enable to auto-detect values from Satellite via hammer
+    satellite_discovery_enabled: false
     # Align with Satellite Hostgroup 'Compute' (Id 2)
     org: "RedHat"
     location: "Denver"
@@ -21,6 +23,10 @@
     pxe_loader: ""
 
   tasks:
+
+  - name: Discover Satellite defaults (optional)
+    include_tasks: tasks/discover_satellite_defaults.yml
+    when: satellite_discovery_enabled | default(true) | bool
 
   - name: Get existing node names from Satellite
     command: hammer host list --search "name ~ {{ node_prefix }}" --fields name --per-page 1000
