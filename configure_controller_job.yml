@@ -1,0 +1,90 @@
+---
+- name: Configure AAP Controller Job Template with Survey for batch node builds
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    # Controller connection (set via extra-vars or controller_vars.yml)
+    controller_host: "https://aap-controller.example.com"
+    controller_oauthtoken: ""
+    controller_verify_ssl: true
+
+    # Resource names in Controller
+    organization_name: "Default"
+    project_name: "AnsibleLaunchPad"
+    inventory_name: "Default Inventory"
+    credential_name: ""
+    execution_environment: ""
+
+    # Job Template settings
+    job_template_name: "Build Nodes in Batches"
+    job_description: "Create nodes in batches of 5 using the Compute hostgroup"
+    job_playbook_path: "AnsibleSatellite/build_nodes_in_batches.yml"
+
+  tasks:
+    - name: Validate required vars are set
+      assert:
+        that:
+          - controller_host | length > 0
+          - controller_oauthtoken | length > 0
+          - project_name | length > 0
+          - inventory_name | length > 0
+          - job_playbook_path | length > 0
+        fail_msg: >-
+          Missing required controller vars. Set controller_host, controller_oauthtoken,
+          project_name, inventory_name, and job_playbook_path via -e or a vars file.
+
+    - name: Build Survey spec for iterations and knobs
+      set_fact:
+        survey_spec:
+          name: "Build Nodes in Batches Survey"
+          description: "Decide how many 5-node batches to build and pacing/naming"
+          spec:
+            - question_name: "How many batches? (each batch builds 5 nodes)"
+              required: true
+              type: "integer"
+              variable: "iterations"
+              min: 1
+              max: 100
+              default: 1
+              new_question: true
+            - question_name: "Node prefix (e.g., 'node')"
+              required: true
+              type: "text"
+              variable: "node_prefix"
+              default: "node"
+              new_question: true
+            - question_name: "Delay between node creations (seconds)"
+              required: true
+              type: "integer"
+              variable: "delay_seconds"
+              min: 0
+              max: 3600
+              default: 30
+              new_question: true
+            - question_name: "Delay between batches (seconds)"
+              required: true
+              type: "integer"
+              variable: "delay_between_batches"
+              min: 0
+              max: 7200
+              default: 60
+              new_question: true
+
+    - name: Ensure Job Template exists and has Survey
+      ansible.controller.job_template:
+        controller_host: "{{ controller_host }}"
+        controller_oauthtoken: "{{ controller_oauthtoken }}"
+        validate_certs: "{{ controller_verify_ssl }}"
+        name: "{{ job_template_name }}"
+        description: "{{ job_description }}"
+        organization: "{{ organization_name }}"
+        project: "{{ project_name }}"
+        inventory: "{{ inventory_name }}"
+        playbook: "{{ job_playbook_path }}"
+        job_type: run
+        survey_enabled: true
+        survey_spec: "{{ survey_spec }}"
+        credentials: "{{ credential_name if credential_name | length > 0 else omit }}"
+        execution_environment: "{{ execution_environment if execution_environment | length > 0 else omit }}"
+        state: present

@@ -1,0 +1,16 @@
+# Example variables for configuring the AAP Controller Job Template
+# Copy to controller_vars.yml and fill in your environment specifics
+
+controller_host: "https://controller.prod.spg"
+controller_oauthtoken: "REPLACE_WITH_AAP_OAUTH_TOKEN"
+controller_verify_ssl: true
+
+organization_name: "Default"
+project_name: "AnsibleLaunchPad"
+inventory_name: "Default Inventory"
+credential_name: "Machine Credential"
+execution_environment: "Default execution environment"
+
+job_template_name: "Build Nodes in Batches"
+job_description: "Create nodes in batches of 5 using the Compute hostgroup"
+job_playbook_path: "AnsibleSatellite/build_nodes_in_batches.yml"
