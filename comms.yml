@@ -1,0 +1,316 @@
+---
+- name: Prepare Satellite server
+  hosts: satellite
+  become: true
+  tags:
+    - satellite_prep
+  vars:
+    env_conf_path: "{{ lookup('env', 'ANSIBLE_ENV_CONF') | default('~/.ansible/conf/env.conf', true) }}"
+  tasks:
+    - name: Ensure CA cert exists on Satellite
+      ansible.builtin.stat:
+        path: /root/katello-server-ca.crt
+      register: satellite_ca
+
+    - name: Debug Satellite CA cert presence
+      ansible.builtin.debug:
+        msg: "Satellite CA cert found: {{ satellite_ca.stat.exists }}"
+
+- name: Configure AAP trust and create Satellite inventory source
+  hosts: localhost
+  become: true
+  vars:
+    env_conf_path: "{{ lookup('env', 'ANSIBLE_ENV_CONF') | default('~/.ansible/conf/env.conf', true) }}"
+    satellite_ca_path: /etc/pki/ca-trust/source/anchors/satellite-ca.crt
+    aap_ca_path: /etc/pki/ca-trust/source/anchors/aap-ca.crt
+    organization_id: 1
+  pre_tasks:
+    - name: Check env.conf exists
+      ansible.builtin.stat:
+        path: "{{ env_conf_path }}"
+      register: env_conf_stat
+    - name: Fail if env.conf missing
+      ansible.builtin.fail:
+        msg: "env.conf not found at {{ env_conf_path }}. Copy env.conf.example there and populate secrets (chmod 600)."
+      when: not env_conf_stat.stat.exists
+    - name: Read env.conf content
+      ansible.builtin.slurp:
+        src: "{{ env_conf_path }}"
+      register: env_conf_raw
+    - name: Set environment facts from env.conf (simple parser)
+      ansible.builtin.set_fact:
+        env_lines: "{{ (env_conf_raw.content | b64decode).splitlines() }}"
+    - name: Derive key/value dict
+      ansible.builtin.set_fact:
+        env_kv: "{{ env_lines | reject('match','^#') | reject('equalto','') | map('regex_search','^(?:\\[default\\])?(.*)$') | list }}"
+      when: false  # placeholder to show transformation steps (not executed)
+    - name: Extract needed values
+      vars:
+        decoded: "{{ env_conf_raw.content | b64decode }}"
+      ansible.builtin.set_fact:
+        satellite_host_fqdn: "{{ (decoded | regex_search('SATELLITE_HOST_FQDN=(.*)', '\\1')) | default('') }}"
+        gateway_server: "{{ (decoded | regex_search('ANSIBLE_HOST_FQDN=(.*)', '\\1')) | default('') }}"
+        satellite_api_user: "{{ (decoded | regex_search('SATELLITE_API_USER=(.*)', '\\1')) | default('') }}"
+        satellite_api_password: "{{ (decoded | regex_search('SATELLITE_API_PASSWORD=(.*)', '\\1')) | default('') }}"
+        aap_api_user: "{{ (decoded | regex_search('AAP_API_USER=(.*)', '\\1')) | default('') }}"
+        aap_api_password: "{{ (decoded | regex_search('AAP_API_PASSWORD=(.*)', '\\1')) | default('') }}"
+    - name: Assert required keys present in env.conf
+      ansible.builtin.assert:
+        that:
+          - satellite_host_fqdn | length > 0
+          - gateway_server | length > 0
+          - satellite_api_user | length > 0
+          - satellite_api_password | length > 0
+          - aap_api_user | length > 0
+          - aap_api_password | length > 0
+        fail_msg: "Missing required keys in {{ env_conf_path }} (need SATELLITE_HOST_FQDN, ANSIBLE_HOST_FQDN, SATELLITE_API_USER/PASSWORD, AAP_API_USER/PASSWORD)."
+  tasks:
+    - name: Ensure required packages are installed
+      ansible.builtin.package:
+        name:
+          - python3-requests
+          - ca-certificates
+          - openssl
+        state: present
+
+    - name: Export Satellite certificate chain into trust anchors
+      ansible.builtin.shell: |
+        openssl s_client -connect {{ satellite_host_fqdn }}:443 -showcerts </dev/null 2>/dev/null \
+        | awk '/BEGIN CERTIFICATE/,/END CERTIFICATE/' > {{ satellite_ca_path }}
+      args:
+        creates: "{{ satellite_ca_path }}"
+
+    - name: Export AAP certificate chain into trust anchors
+      ansible.builtin.shell: |
+        openssl s_client -connect {{ gateway_server }}:443 -showcerts </dev/null 2>/dev/null \
+        | awk '/BEGIN CERTIFICATE/,/END CERTIFICATE/' > {{ aap_ca_path }}
+      args:
+        creates: "{{ aap_ca_path }}"
+
+    - name: Update CA trust store
+      ansible.builtin.command: update-ca-trust extract
+
+    - name: Configure foreman.yml inventory plugin (local test file)
+      ansible.builtin.copy:
+        dest: /etc/ansible/foreman.yml
+        content: |
+          plugin: redhat.satellite.foreman
+          url: https://{{ satellite_host_fqdn }}
+          username: {{ satellite_api_user }}
+          password: {{ satellite_api_password }}
+          validate_certs: true
+          ssl_verify: {{ satellite_ca_path }}
+
+    - name: Authenticate to AAP API (controller v2)
+      ansible.builtin.uri:
+        url: "https://{{ gateway_server }}/api/controller/v2/tokens/"
+        method: POST
+        user: "{{ aap_api_user }}"
+        password: "{{ aap_api_password }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          description: "Token created by Ansible playbook"
+        status_code: 201
+        validate_certs: false   # flip to true once CA PEM is installed
+        ca_path: "{{ aap_ca_path }}"
+      register: aap_token
+      retries: 5
+      delay: 5
+      until: aap_token.status == 201
+
+    - name: Lookup credential type id for Red Hat Satellite
+      ansible.builtin.uri:
+        url: "https://{{ gateway_server }}/api/controller/v2/credential_types/?name__icontains=Satellite"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ aap_token.json.token }}"
+        return_content: true
+        validate_certs: false
+        ca_path: "{{ aap_ca_path }}"
+      register: satellite_credtype_search
+
+    - name: Set Satellite credential type id
+      ansible.builtin.set_fact:
+        satellite_credential_type_id: "{{ (satellite_credtype_search.json.results | selectattr('name','search','Satellite') | list | first).id }}"
+      when: (satellite_credtype_search.json.count | int) > 0
+
+    - name: Fail if Satellite credential type not found
+      ansible.builtin.fail:
+        msg: "Could not find 'Red Hat Satellite' credential type on controller {{ gateway_server }}"
+      when: satellite_credential_type_id is not defined
+
+    - name: Create Satellite API credential in AAP (idempotent)
+      ansible.builtin.uri:
+        url: "https://{{ gateway_server }}/api/controller/v2/credentials/"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ aap_token.json.token }}"
+        body_format: json
+        body:
+          name: "Satellite API Credential"
+          credential_type: "{{ satellite_credential_type_id }}"
+          organization: "{{ organization_id }}"
+          inputs:
+            host: "https://{{ satellite_host_fqdn }}"
+            username: "{{ satellite_api_user }}"
+            password: "{{ satellite_api_password }}"
+        status_code: [201, 400]
+        validate_certs: false
+        ca_path: "{{ aap_ca_path }}"
+      register: satellite_api_cred_create
+      failed_when: satellite_api_cred_create.status not in [201, 400]
+
+    - name: Debug credential create response (status and minimal body)
+      ansible.builtin.debug:
+        msg:
+          status: "{{ satellite_api_cred_create.status }}"
+          json: "{{ satellite_api_cred_create.json | default({}) }}"
+          location: "{{ satellite_api_cred_create.location | default('') }}"
+
+    - name: Lookup Satellite API credential (by name/org)
+      ansible.builtin.uri:
+        url: "https://{{ gateway_server }}/api/controller/v2/credentials/?name={{ 'Satellite API Credential' | urlencode }}&organization={{ organization_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ aap_token.json.token }}"
+        return_content: true
+        validate_certs: false
+        ca_path: "{{ aap_ca_path }}"
+      register: satellite_api_cred_lookup
+
+    - name: Debug credential lookup count
+      ansible.builtin.debug:
+        msg:
+          count: "{{ satellite_api_cred_lookup.json.count | default('') }}"
+          first_id: "{{ (satellite_api_cred_lookup.json.results[0].id | string) if (satellite_api_cred_lookup.json.results | length) > 0 else '' }}"
+
+    - name: Set satellite_api_cred_id fact (prefer lookup result)
+      ansible.builtin.set_fact:
+        satellite_api_cred_id: "{{ satellite_api_cred_lookup.json.results[0].id }}"
+      when: (satellite_api_cred_lookup.json.results | length) > 0
+
+    - name: Set satellite_api_cred_id fact (fallback to create response)
+      ansible.builtin.set_fact:
+        satellite_api_cred_id: "{{ satellite_api_cred_create.json.id }}"
+      when: satellite_api_cred_id is not defined and (satellite_api_cred_create.json is defined) and (satellite_api_cred_create.json.id is defined)
+
+    - name: Fail if satellite_api_cred_id is not set
+      ansible.builtin.fail:
+        msg: "Unable to determine Satellite API credential id"
+      when: satellite_api_cred_id is not defined
+
+    - name: Create Inventory in AAP (idempotent)
+      ansible.builtin.uri:
+        url: "https://{{ gateway_server }}/api/controller/v2/inventories/"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ aap_token.json.token }}"
+        body_format: json
+        body:
+          name: "Satellite Inventory"
+          organization: "{{ organization_id }}"
+        status_code: [201, 400]
+        validate_certs: false
+        ca_path: "{{ aap_ca_path }}"
+      register: satellite_inventory_create
+      failed_when: satellite_inventory_create.status not in [201, 400]
+
+    - name: Lookup existing Inventory (on duplicate)
+      ansible.builtin.uri:
+        url: "https://{{ gateway_server }}/api/controller/v2/inventories/?name={{ 'Satellite Inventory' | urlencode }}&organization={{ organization_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ aap_token.json.token }}"
+        return_content: true
+        validate_certs: false
+        ca_path: "{{ aap_ca_path }}"
+      register: satellite_inventory_lookup
+      when: satellite_inventory_create.status == 400
+
+    - name: Set satellite_inventory_id fact
+      ansible.builtin.set_fact:
+        satellite_inventory_id: >-
+          {{ (satellite_inventory_create.json.id if satellite_inventory_create.status == 201 else (satellite_inventory_lookup.json.results[0].id | default(omit))) }}
+
+    - name: Create Inventory Source in AAP (idempotent)
+      ansible.builtin.uri:
+        url: "https://{{ gateway_server }}/api/controller/v2/inventory_sources/"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ aap_token.json.token }}"
+        body_format: json
+        body:
+          name: "Satellite Source"
+          source: "satellite6"
+          inventory: "{{ satellite_inventory_id }}"
+          credential: "{{ satellite_api_cred_id }}"
+          source_vars: |
+            validate_certs: false
+        status_code: [201, 400]
+        validate_certs: false
+        ca_path: "{{ aap_ca_path }}"
+      register: satellite_source_create
+      failed_when: satellite_source_create.status not in [201, 400]
+
+    - name: Lookup existing Inventory Source (on duplicate)
+      ansible.builtin.uri:
+        url: "https://{{ gateway_server }}/api/controller/v2/inventory_sources/?name={{ 'Satellite Source' | urlencode }}&inventory={{ satellite_inventory_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ aap_token.json.token }}"
+        return_content: true
+        validate_certs: false
+        ca_path: "{{ aap_ca_path }}"
+      register: satellite_source_lookup
+      when: satellite_source_create.status == 400
+
+    - name: Set satellite_source_id fact
+      ansible.builtin.set_fact:
+        satellite_source_id: >-
+          {{ (satellite_source_create.json.id if satellite_source_create.status == 201 else (satellite_source_lookup.json.results[0].id | default(omit))) }}
+
+    - name: Get current Inventory Source details
+      ansible.builtin.uri:
+        url: "https://{{ gateway_server }}/api/controller/v2/inventory_sources/{{ satellite_source_id }}/"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ aap_token.json.token }}"
+        return_content: true
+        validate_certs: false
+        ca_path: "{{ aap_ca_path }}"
+      register: current_inventory_source
+
+    - name: Patch Inventory Source to use correct credential and vars (if needed)
+      ansible.builtin.uri:
+        url: "https://{{ gateway_server }}/api/controller/v2/inventory_sources/{{ satellite_source_id }}/"
+        method: PATCH
+        headers:
+          Authorization: "Bearer {{ aap_token.json.token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          credential: "{{ satellite_api_cred_id }}"
+          source_vars: |
+            validate_certs: false
+        status_code: 200
+        validate_certs: false
+        ca_path: "{{ aap_ca_path }}"
+      when: "(current_inventory_source.json.credential | default(0) | int) != (satellite_api_cred_id | int) or (current_inventory_source.json.source_vars | default('')) != 'validate_certs: false\n'"
+
+    - name: Sync Inventory Source
+      ansible.builtin.uri:
+        url: "https://{{ gateway_server }}/api/controller/v2/inventory_sources/{{ satellite_source_id }}/update/"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ aap_token.json.token }}"
+        status_code: 202
+        validate_certs: false
+        ca_path: "{{ aap_ca_path }}"
+      register: sync_result
+
+    - name: Show sync result
+      ansible.builtin.debug:
+        var: sync_result.json
+
+

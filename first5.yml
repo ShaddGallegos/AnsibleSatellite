@@ -6,27 +6,29 @@
     node_prefix: "node"
     total_nodes: 5
     delay_seconds: 30
-    org: "Your_Organization"
-    location: "Your_Location"
-    hostgroup: "RHEL9"
-    compute_resource: "libvirt-hypervisor"
-    compute_profile: "1-Small"
-    domain: "prod.spg"
-    subnet: "prod-subnet"
-    architecture: "x86_64"
-    os: "RedHat 9.0"
-    medium: "Red Hat 9.0 Kickstart"
-    pxe_loader: "PXELinux BIOS"
+    # Align with Satellite Hostgroup 'Compute' (Id 2)
+    org: "RedHat"
+    location: "Denver"
+    hostgroup: "Compute"
+    # The following are intentionally left blank to let Hostgroup defaults apply
+    compute_resource: ""
+    compute_profile: ""
+    domain: ""
+    subnet: ""
+    architecture: ""
+    os: ""
+    medium: ""
+    pxe_loader: ""
 
   tasks:
 
   - name: Get existing node names from Satellite
-    command: hammer host list --search "name ~ node" --fields name --per-page 1000
+    command: hammer host list --search "name ~ {{ node_prefix }}" --fields name --per-page 1000
     register: hammer_output
 
   - name: Extract used node numbers
     set_fact:
-      used_nodes: "{{ hammer_output.stdout | regex_findall('node(\\d{3})') | map('int') | list }}"
+      used_nodes: "{{ hammer_output.stdout | regex_findall(node_prefix ~ '(\\d{3})') | map('int') | list }}"
 
   - name: Determine next available node names
     set_fact:
@@ -42,33 +44,10 @@
         }}
 
   - name: Create nodes with delay
+    include_tasks: tasks/create_node.yml
     loop: "{{ available_nodes }}"
     loop_control:
-      label: "{{ item }}"
-    block:
-
-      - name: Create node {{ item }}
-        command: >
-          hammer host create
-          --name {{ item }}
-          --organization "{{ org }}"
-          --location "{{ location }}"
-          --hostgroup "{{ hostgroup }}"
-          --compute-resource "{{ compute_resource }}"
-          --compute-profile "{{ compute_profile }}"
-          --domain "{{ domain }}"
-          --subnet "{{ subnet }}"
-          --architecture "{{ architecture }}"
-          --operatingsystem "{{ os }}"
-          --medium "{{ medium }}"
-          --pxe-loader "{{ pxe_loader }}"
-          --managed true
-          --build true
-          --enabled true
-        register: create_result
-        changed_when: "'Host created' in create_result.stdout"
-
-      - name: Wait before creating next node
-        pause:
-          seconds: "{{ delay_seconds }}"
+      loop_var: node_name
+      label: "{{ node_name }}"
+    when: available_nodes | length > 0
 

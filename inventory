@@ -1,0 +1,6 @@
+[satellite]
+satellite.prod.spg ansible_host=10.168.151.127
+
+[ansible]
+ansible.prod.spg ansible_host=10.168.151.126
+
