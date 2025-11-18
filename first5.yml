@@ -33,8 +33,14 @@
     register: hammer_output
 
   - name: Extract used node numbers
-    set_fact:
-      used_nodes: "{{ hammer_output.stdout | regex_findall(node_prefix ~ '(\\d{3})') | map('int') | list }}"
+    ansible.builtin.set_fact:
+      used_nodes: >-
+        {{
+          (hammer_output.stdout | default(''))
+          | regex_findall(node_prefix ~ '(\\d{3})')
+          | map('int')
+          | list
+        }}
 
   - name: Determine next available node names
     set_fact:
