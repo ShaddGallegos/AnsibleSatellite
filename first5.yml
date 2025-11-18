@@ -24,6 +24,12 @@
 
   tasks:
 
+  - name: Check if hammer is available
+    ansible.builtin.command: which hammer
+    register: hammer_check
+    changed_when: false
+    failed_when: false
+
   - name: Discover Satellite defaults (optional)
     include_tasks: tasks/discover_satellite_defaults.yml
     when: satellite_discovery_enabled | default(true) | bool
