@@ -2,16 +2,14 @@
 # Copy to controller_vars.yml and fill in your environment specifics
 
 controller_host: "https://ansible.prod.spg"
-controller_oauthtoken: ""
-controller_username: ""
-controller_password: ""
-controller_verify_ssl: true
+controller_oauthtoken: "REPLACE_WITH_AAP_OAUTH_TOKEN"
+controller_verify_ssl: false
 
 organization_name: "Default"
 project_name: "AnsibleLaunchPad"
 inventory_name: "Satellite"
-credential_name: "Machine Credential"
-execution_environment: "Default execution environment"
+credential_name: ""
+execution_environment: ""
 
 job_template_name: "Build Nodes in Batches"
 job_description: "Create nodes in batches of 5 using the Compute hostgroup"

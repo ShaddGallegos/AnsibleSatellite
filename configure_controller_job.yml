@@ -1,6 +1,7 @@
 ---
 - name: Configure AAP Controller Job Template with Survey for batch node builds
   hosts: localhost
+  connection: local
   gather_facts: false
 
   vars:
@@ -22,6 +23,59 @@
     job_playbook_path: "AnsibleSatellite/build_nodes_in_batches.yml"
 
   tasks:
+    - name: Normalize Controller auth inputs (token or username/password or env)
+      set_fact:
+        _controller_token: "{{ (controller_oauthtoken | default(lookup('env','CONTROLLER_OAUTH_TOKEN'), true)) | default('', true) }}"
+        _controller_username: "{{ (controller_username | default(lookup('env','CONTROLLER_USERNAME'), true)) | default('', true) }}"
+        _controller_password: "{{ (controller_password | default(lookup('env','CONTROLLER_PASSWORD'), true)) | default('', true) }}"
+
+    - name: Prompt for Controller username if not provided and no token
+      ansible.builtin.pause:
+        prompt: "Controller username (leave blank to abort)"
+      register: _prompt_username
+      when: _controller_token | length == 0 and _controller_username | length == 0
+
+    - name: Prompt for Controller password when username was prompted
+      ansible.builtin.pause:
+        prompt: "Controller password"
+        echo: no
+      register: _prompt_password
+      when: _controller_token | length == 0 and _controller_username | length == 0
+
+    - name: Apply prompted credentials
+      set_fact:
+        _controller_username: "{{ _prompt_username.user_input | default(_controller_username) }}"
+        _controller_password: "{{ _prompt_password.user_input | default(_controller_password) }}"
+      when: _controller_token | length == 0 and _controller_username | length == 0
+
+    - name: Validate we have a usable auth method (token or username/password)
+      assert:
+        that:
+          - _controller_token | length > 0 or (_controller_username | length > 0 and _controller_password | length > 0)
+        fail_msg: >-
+          Missing or invalid Controller credentials. Provide controller_oauthtoken
+          (or env CONTROLLER_OAUTH_TOKEN) OR controller_username/controller_password
+          (or env CONTROLLER_USERNAME/CONTROLLER_PASSWORD).
+    - name: Preflight | Reach Controller API (optional)
+      ansible.builtin.uri:
+        url: "{{ controller_host }}/api/controller/v2/ping/"
+        method: GET
+        return_content: false
+        status_code: 200
+        validate_certs: "{{ controller_verify_ssl }}"
+        headers: "{{ ({'Authorization': 'Bearer ' ~ _controller_token}) if (_controller_token | length > 0) else omit }}"
+        url_username: "{{ _controller_username if (_controller_token | length == 0 and _controller_username | length > 0) else omit }}"
+        url_password: "{{ _controller_password if (_controller_token | length == 0 and _controller_password | length > 0) else omit }}"
+        force_basic_auth: "{{ 'yes' if (_controller_token | length == 0 and _controller_username | length > 0) else omit }}"
+      register: controller_ping
+      ignore_errors: true
+
+    - name: Preflight | Warn if Controller API is unreachable
+      ansible.builtin.debug:
+        msg: >-
+          Warning: Could not reach {{ controller_host }} API (SSL/DNS?).
+          Set controller_verify_ssl: false or ensure CA trust; proceeding to try module anyway.
+      when: controller_ping is failed
     - name: Validate required vars are set
       assert:
         that:
@@ -71,10 +125,43 @@
               default: 60
               new_question: true
 
-    - name: Ensure Job Template exists and has Survey
+    - block:
+        - name: Ensure Job Template exists (initial creation)
+          ansible.controller.job_template:
+            controller_host: "{{ controller_host }}"
+            controller_oauthtoken: "{{ _controller_token if _controller_token | length > 0 else omit }}"
+            controller_username: "{{ _controller_username if (_controller_token | length == 0 and _controller_username | length > 0) else omit }}"
+            controller_password: "{{ _controller_password if (_controller_token | length == 0 and _controller_password | length > 0) else omit }}"
+            validate_certs: "{{ controller_verify_ssl }}"
+            name: "{{ job_template_name }}"
+            description: "{{ job_description }}"
+            organization: "{{ organization_name }}"
+            project: "{{ project_name }}"
+            inventory: "{{ inventory_name }}"
+            playbook: "{{ job_playbook_path }}"
+            job_type: run
+            credentials: "{{ [credential_name] if credential_name | length > 0 else omit }}"
+            execution_environment: "{{ execution_environment if execution_environment | length > 0 else omit }}"
+            survey_enabled: false
+            state: present
+      rescue:
+        - name: Auth failure help
+          ansible.builtin.debug:
+            msg: >-
+              Authentication failed for {{ controller_host }}. Ensure either
+              a valid token (controller_oauthtoken or CONTROLLER_OAUTH_TOKEN) is set,
+              or provide controller_username/controller_password. If using SSO,
+              generate a Personal Access Token in the Controller UI.
+        - name: Fail explicitly after auth hint
+          ansible.builtin.fail:
+            msg: "Controller authentication failed (HTTP 401)."
+
+    - name: Ensure Job Template survey is configured
       ansible.controller.job_template:
         controller_host: "{{ controller_host }}"
-        controller_oauthtoken: "{{ controller_oauthtoken }}"
+        controller_oauthtoken: "{{ _controller_token if _controller_token | length > 0 else omit }}"
+        controller_username: "{{ _controller_username if (_controller_token | length == 0 and _controller_username | length > 0) else omit }}"
+        controller_password: "{{ _controller_password if (_controller_token | length == 0 and _controller_password | length > 0) else omit }}"
         validate_certs: "{{ controller_verify_ssl }}"
         name: "{{ job_template_name }}"
         description: "{{ job_description }}"
@@ -85,6 +172,6 @@
         job_type: run
         survey_enabled: true
         survey_spec: "{{ survey_spec }}"
-        credentials: "{{ credential_name if credential_name | length > 0 else omit }}"
+        credentials: "{{ [credential_name] if credential_name | length > 0 else omit }}"
         execution_environment: "{{ execution_environment if execution_environment | length > 0 else omit }}"
         state: present
