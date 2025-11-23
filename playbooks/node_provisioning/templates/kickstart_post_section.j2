@@ -1,0 +1,89 @@
+%post --log=/root/ks-post.log
+set -euo pipefail
+log() { echo "[POST] $(date +%F_%T) $*" | tee -a /root/post-install-summary.txt; }
+warn() { echo "[POST][WARN] $(date +%F_%T) $*" | tee -a /root/post-install-summary.txt; }
+err()  { echo "[POST][ERROR] $(date +%F_%T) $*" | tee -a /root/post-install-summary.txt; }
+ADMIN_USER={{ admin_user }}
+ADMIN_PASS_PLAIN='{{ admin_password }}'
+FORCE_CHANGE={{ force_password_change | bool | ternary('true','false') }}
+FIREWALL_SERVICES='{{ ks_firewall_services }}'
+ACTIVATION_KEYS='{{ activation_keys }}'
+SAT_IP='{{ satellite_ip }}'
+SAT_FQDN='{{ satellite_fqdn }}'
+OS_MAJOR=$(grep -oE 'release ([0-9]+)' /etc/redhat-release | awk '{print $2}')
+AK_USED=$(echo "$ACTIVATION_KEYS" | tr ',' '\n' | awk -F: -v M="$OS_MAJOR" '$1==M {print $2}')
+sleep 5
+log "Starting post-install on $(hostname) (OS_MAJOR=$OS_MAJOR)"
+# Admin user creation & password hashing
+if id "$ADMIN_USER" >/dev/null 2>&1; then
+  log "User $ADMIN_USER exists"
+else
+  useradd -m -s /bin/bash "$ADMIN_USER" || err "Failed useradd"
+fi
+if command -v openssl >/dev/null 2>&1; then HASH=$(openssl passwd -6 "$ADMIN_PASS_PLAIN"); fi
+if [ -z "${HASH:-}" ]; then HASH="$ADMIN_PASS_PLAIN"; warn "openssl missing, storing plaintext (insecure)"; fi
+usermod -p "$HASH" "$ADMIN_USER" || warn "Password set failed"
+if [ "$FORCE_CHANGE" = "true" ]; then chage -d 0 "$ADMIN_USER" || warn "chage failed"; fi
+grep -q "^$ADMIN_USER " /etc/sudoers || echo "$ADMIN_USER ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+# SSH adjustments
+if grep -q '^PermitRootLogin' /etc/ssh/sshd_config; then sed -i 's/^PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config; else echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config; fi
+systemctl restart sshd || warn "sshd restart failed"
+# Generate admin key if absent
+ADMIN_HOME=$(getent passwd "$ADMIN_USER" | cut -d: -f6)
+if [ -n "$ADMIN_HOME" ]; then
+  mkdir -p "$ADMIN_HOME/.ssh" && chmod 700 "$ADMIN_HOME/.ssh"
+  if [ ! -f "$ADMIN_HOME/.ssh/id_rsa" ]; then sudo -u "$ADMIN_USER" ssh-keygen -t rsa -b 4096 -N '' -f "$ADMIN_HOME/.ssh/id_rsa" -C "$ADMIN_USER@$(hostname)" || warn "admin keygen failed"; fi
+fi
+# Inject collected public keys
+ROOT_AUTH=/root/.ssh/authorized_keys
+mkdir -p /root/.ssh && chmod 700 /root/.ssh
+touch "$ROOT_AUTH" && chmod 600 "$ROOT_AUTH"
+if [ -n "$ADMIN_HOME" ]; then touch "$ADMIN_HOME/.ssh/authorized_keys" && chmod 600 "$ADMIN_HOME/.ssh/authorized_keys"; fi
+cat > /tmp/all_keys.txt <<'KEYS'
+{{ _all_public_keys | join('\n') }}
+KEYS
+while read -r K; do
+  [ -z "$K" ] && continue
+  grep -qxF "$K" "$ROOT_AUTH" || echo "$K" >> "$ROOT_AUTH"
+  if [ -n "$ADMIN_HOME" ]; then grep -qxF "$K" "$ADMIN_HOME/.ssh/authorized_keys" || echo "$K" >> "$ADMIN_HOME/.ssh/authorized_keys"; fi
+done < /tmp/all_keys.txt
+rm -f /tmp/all_keys.txt
+# Satellite registration
+if command -v subscription-manager >/dev/null 2>&1; then
+  if ! subscription-manager identity >/dev/null 2>&1; then
+    if [ -n "$AK_USED" ]; then
+      rpm -Uvh --nodigest --nofiledigest --replacepkgs http://$SAT_IP/pub/katello-ca-consumer-$SAT_FQDN-1.0-1.noarch.rpm || warn "CA RPM failed"
+      subscription-manager register --org=Default_Organization --activationkey="$AK_USED" || warn "Registration failed"
+    else
+      warn "No activation key mapped for OS_MAJOR=$OS_MAJOR"
+    fi
+  else
+    log "Already registered"
+  fi
+else
+  warn "subscription-manager missing"
+fi
+if subscription-manager identity >/dev/null 2>&1; then
+  subscription-manager repos --enable "satellite-client-6-for-rhel-$OS_MAJOR-x86_64-rpms" || warn "Repo enable failed"
+  yum -y install katello-agent || warn "katello-agent install failed"
+fi
+# Firewall
+if systemctl status firewalld >/dev/null 2>&1; then
+  systemctl enable --now firewalld || warn "firewalld start failed"
+  IFS=','; for S in $FIREWALL_SERVICES; do firewall-cmd --permanent --add-service="$S" || warn "svc $S"; done
+  firewall-cmd --reload || warn "reload failed"
+else
+  warn "firewalld not available"
+fi
+# Updates
+if {{ ks_enable_updates | bool | ternary('true','false') }}; then
+  yum -y update || warn "Updates incomplete"
+else
+  log "Updates skipped"
+fi
+log "Post-install complete"
+log "Admin user: $ADMIN_USER"
+log "Activation key used: ${AK_USED:-None}"
+log "Registration: $(subscription-manager identity >/dev/null 2>&1 && echo Registered || echo NotRegistered)"
+log "Firewall: $(systemctl is-active firewalld 2>/dev/null || echo inactive)"
+%end

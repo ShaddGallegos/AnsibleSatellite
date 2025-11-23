@@ -1,0 +1,58 @@
+---
+# AAP Controller Configuration Variables
+# Copy this file to controller_vars.yml and customize for your environment
+# Keep controller_vars.yml out of version control (contains credentials)
+
+# ========================================
+# Controller Connection
+# ========================================
+controller_host: "https://ansible.prod.spg"
+
+# Authentication Method 1: OAuth Token (recommended)
+# Generate token in AAP UI: Administration > Users > <your user> > Tokens
+controller_oauthtoken: ""
+
+# Authentication Method 2: Username/Password (fallback)
+controller_username: ""
+controller_password: ""
+
+# Certificate verification (set to false for self-signed certs)
+controller_verify_ssl: false
+
+# ========================================
+# Organization and Project
+# ========================================
+organization_name: "Default"
+project_name: "AnsibleLaunchPad"
+
+# ========================================
+# Inventory and Credentials
+# ========================================
+# Inventory name (should already exist in AAP)
+inventory_name: "Satellite Inventory"
+
+# Optional: Credential name for SSH/machine access
+# Leave empty if not required for these playbooks
+credential_name: ""
+
+# Optional: Execution environment
+# Leave empty to use default
+execution_environment: ""
+
+# ========================================
+# API Retry Configuration
+# ========================================
+# Number of retries for API calls
+api_retry_count: 3
+
+# Delay between retries (seconds)
+api_retry_delay: 5
+
+# ========================================
+# Notes
+# ========================================
+# 1. OAuth tokens are more secure than username/password
+# 2. Generate token with 'Write' scope for job template creation
+# 3. Set controller_verify_ssl: false only in lab environments
+# 4. Keep this file permissions: chmod 600 controller_vars.yml
+# 5. Add to .gitignore to prevent credential leakage

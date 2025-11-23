@@ -1,0 +1,627 @@
+---
+# Consolidated playbook for setting up Satellite and AAP integration
+# Synopsis: Establishes Satellite–AAP integration: CA trust, connectivity validation, inventory source & credential provisioning with resilient fallback logic.
+# Combines certificate trust, API configuration, and inventory source creation
+# with improved error handling, conditional logic, and fallback options
+
+- name: Prepare Satellite server and verify connectivity
+  hosts: satellite
+  become: true
+  gather_facts: true
+  tags:
+    - satellite_prep
+    - connectivity
+  
+  vars:
+    ansible_user: "{{ ansible_user | default('root') }}"
+    satellite_ca_path: /root/katello-server-ca.crt
+    alternative_ca_paths:
+      - /etc/pki/katello/certs/katello-server-ca.crt
+      - /etc/pki/katello-certs-tools/katello-server-ca.crt
+      - /usr/share/foreman/certs/katello-server-ca.crt
+  
+  pre_tasks:
+    - name: Wait for SSH connectivity to Satellite
+      ansible.builtin.wait_for_connection:
+        timeout: 60
+        connect_timeout: 5
+        sleep: 2
+      register: _wait_conn
+      retries: 3
+      delay: 5
+      until: _wait_conn is succeeded
+      failed_when: false
+      tags: always
+
+    - name: Fail if SSH connectivity not established
+      ansible.builtin.fail:
+        msg: "Unable to establish SSH connection to Satellite server after 3 retries"
+      when: _wait_conn is failed
+      tags: always
+
+  tasks:
+    - name: Check primary CA cert location
+      ansible.builtin.stat:
+        path: "{{ satellite_ca_path }}"
+      register: _ca_primary
+      tags: ca_cert
+
+    - name: Search for CA cert in alternative locations
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      register: _ca_alternatives
+      loop: "{{ alternative_ca_paths }}"
+      when: not _ca_primary.stat.exists
+      tags: ca_cert
+
+    - name: Set CA cert path from alternatives
+      ansible.builtin.set_fact:
+        satellite_ca_path: "{{ item.item }}"
+      when:
+        - not _ca_primary.stat.exists
+        - item.stat.exists | default(false)
+      loop: "{{ _ca_alternatives.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item | default('N/A') }}"
+      tags: ca_cert
+
+    - name: Generate CA certificate if not found
+      block:
+        - name: Extract CA certificate from Satellite
+          ansible.builtin.command:
+            cmd: katello-certs-check -c
+          register: _ca_extract
+          changed_when: false
+          failed_when: false
+
+        - name: Copy CA cert to standard location
+          ansible.builtin.copy:
+            src: /etc/pki/katello/certs/katello-server-ca.crt
+            dest: "{{ satellite_ca_path }}"
+            remote_src: true
+            mode: '0644'
+          when: _ca_extract.rc == 0
+      when: not _ca_primary.stat.exists and (_ca_alternatives.results | selectattr('stat.exists') | list | length == 0)
+      rescue:
+        - name: Warn about missing CA certificate
+          ansible.builtin.debug:
+            msg: |
+              WARNING: Could not locate Satellite CA certificate.
+              This may cause certificate verification issues.
+              Expected locations checked:
+              {{ [satellite_ca_path] + alternative_ca_paths | join(', ') }}
+      tags: ca_cert
+
+    - name: Verify Satellite CA cert is readable
+      ansible.builtin.stat:
+        path: "{{ satellite_ca_path }}"
+      register: _ca_final
+      tags: ca_cert
+
+    - name: Display CA certificate status
+      ansible.builtin.debug:
+        msg: "Satellite CA cert {{ 'found' if _ca_final.stat.exists else 'NOT FOUND' }} at {{ satellite_ca_path }}"
+      tags: ca_cert
+
+    - name: Verify Satellite services are running
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: started
+      register: _service_check
+      failed_when: false
+      loop:
+        - foreman
+        - httpd
+        - postgresql
+        - pulpcore-api
+        - pulpcore-content
+        - pulpcore-worker@1
+      tags: health_check
+
+    - name: Report service status
+      ansible.builtin.debug:
+        msg: "Service {{ item.item }}: {{ 'running' if item.status.ActiveState == 'active' else 'NOT RUNNING (' ~ item.status.ActiveState ~ ')' }}"
+      loop: "{{ _service_check.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: _service_check.results is defined
+      tags: health_check
+
+- name: Configure AAP trust and create Satellite inventory source
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags:
+    - aap_config
+    - integration
+  
+  vars:
+    # Configuration file path
+    env_conf_path: "{{ lookup('env', 'ANSIBLE_ENV_CONF') | default('~/.ansible/conf/env.conf', true) }}"
+    
+    # Certificate paths
+    satellite_ca_path: /etc/pki/ca-trust/source/anchors/satellite-ca.crt
+    aap_ca_path: /etc/pki/ca-trust/source/anchors/aap-ca.crt
+    
+    # AAP configuration
+    organization_id: 1
+    organization_name: "Default"
+    
+    # Retry configuration
+    api_retry_count: 5
+    api_retry_delay: 5
+    
+    # Certificate verification (can be disabled for troubleshooting)
+    verify_certificates: false
+
+  pre_tasks:
+    - name: Check if env.conf exists
+      ansible.builtin.stat:
+        path: "{{ env_conf_path }}"
+      register: _env_conf_stat
+      tags: always
+
+    - name: Display env.conf search path
+      ansible.builtin.debug:
+        msg: "Looking for env.conf at: {{ env_conf_path }}"
+      when: not _env_conf_stat.stat.exists
+      tags: always
+
+    - name: Fail if env.conf missing with helpful message
+      ansible.builtin.fail:
+        msg: |
+          Configuration file not found at {{ env_conf_path }}
+          
+          Please create env.conf with the following required variables:
+          SATELLITE_HOST_FQDN=satellite.example.com
+          ANSIBLE_HOST_FQDN=aap.example.com
+          SATELLITE_API_USER=admin
+          SATELLITE_API_PASSWORD=password
+          AAP_API_USER=admin
+          AAP_API_PASSWORD=password
+          
+          You can copy from env.conf.example if available.
+          Set ANSIBLE_ENV_CONF environment variable to use alternate location.
+      when: not _env_conf_stat.stat.exists
+      tags: always
+
+    - name: Read env.conf content
+      ansible.builtin.slurp:
+        src: "{{ env_conf_path }}"
+      register: _env_conf_raw
+      tags: always
+
+    - name: Parse environment variables from env.conf
+      ansible.builtin.set_fact:
+        _env_decoded: "{{ _env_conf_raw.content | b64decode }}"
+      tags: always
+
+    - name: Extract configuration values with fallbacks
+      ansible.builtin.set_fact:
+        satellite_host_fqdn: "{{ _env_decoded | regex_search('SATELLITE_HOST_FQDN=(.*)$', '\\1', multiline=True) | default([''], true) | first | trim }}"
+        gateway_server: "{{ _env_decoded | regex_search('ANSIBLE_HOST_FQDN=(.*)$', '\\1', multiline=True) | default([''], true) | first | trim }}"
+        satellite_api_user: "{{ _env_decoded | regex_search('SATELLITE_API_USER=(.*)$', '\\1', multiline=True) | default(['admin'], true) | first | trim }}"
+        satellite_api_password: "{{ _env_decoded | regex_search('SATELLITE_API_PASSWORD=(.*)$', '\\1', multiline=True) | default([''], true) | first | trim }}"
+        aap_api_user: "{{ _env_decoded | regex_search('AAP_API_USER=(.*)$', '\\1', multiline=True) | default(['admin'], true) | first | trim }}"
+        aap_api_password: "{{ _env_decoded | regex_search('AAP_API_PASSWORD=(.*)$', '\\1', multiline=True) | default([''], true) | first | trim }}"
+      no_log: true
+      tags: always
+
+    - name: Validate required configuration present
+      ansible.builtin.assert:
+        that:
+          - satellite_host_fqdn | length > 0
+          - gateway_server | length > 0
+          - satellite_api_user | length > 0
+          - satellite_api_password | length > 0
+          - aap_api_user | length > 0
+          - aap_api_password | length > 0
+        fail_msg: |
+          Missing required configuration in {{ env_conf_path }}
+          Required: SATELLITE_HOST_FQDN, ANSIBLE_HOST_FQDN, 
+                   SATELLITE_API_USER, SATELLITE_API_PASSWORD,
+                   AAP_API_USER, AAP_API_PASSWORD
+        success_msg: "Configuration validated successfully"
+      tags: always
+
+  tasks:
+    - name: Ensure required packages are installed
+      ansible.builtin.package:
+        name:
+          - python3-requests
+          - ca-certificates
+          - openssl
+        state: present
+      become: true
+      register: _pkg_install
+      failed_when: false
+      tags: packages
+
+    - name: Warn if package installation failed
+      ansible.builtin.debug:
+        msg: "WARNING: Failed to install some packages. Certificate operations may fail."
+      when: _pkg_install is failed
+      tags: packages
+
+    - name: Check Satellite connectivity before certificate export
+      ansible.builtin.wait_for:
+        host: "{{ satellite_host_fqdn }}"
+        port: 443
+        timeout: 10
+      register: _sat_connect
+      failed_when: false
+      tags: certificates
+
+    - name: Export Satellite certificate chain
+      ansible.builtin.shell: |
+        openssl s_client -connect {{ satellite_host_fqdn }}:443 -showcerts </dev/null 2>/dev/null \
+        | awk '/BEGIN CERTIFICATE/,/END CERTIFICATE/' > {{ satellite_ca_path }}
+      args:
+        creates: "{{ satellite_ca_path }}"
+      become: true
+      when: _sat_connect is succeeded
+      register: _sat_cert_export
+      failed_when: false
+      tags: certificates
+
+    - name: Check if Satellite certificate was exported
+      ansible.builtin.stat:
+        path: "{{ satellite_ca_path }}"
+      register: _sat_cert_stat
+      tags: certificates
+
+    - name: Warn if Satellite certificate export failed
+      ansible.builtin.debug:
+        msg: |
+          WARNING: Could not export Satellite certificate from {{ satellite_host_fqdn }}
+          Reason: {{ 'Host unreachable' if _sat_connect is failed else 'Certificate export failed' }}
+          Certificate verification may fail. Consider setting verify_certificates: false
+      when: not _sat_cert_stat.stat.exists
+      tags: certificates
+
+    - name: Check AAP connectivity before certificate export
+      ansible.builtin.wait_for:
+        host: "{{ gateway_server }}"
+        port: 443
+        timeout: 10
+      register: _aap_connect
+      failed_when: false
+      tags: certificates
+
+    - name: Export AAP certificate chain
+      ansible.builtin.shell: |
+        openssl s_client -connect {{ gateway_server }}:443 -showcerts </dev/null 2>/dev/null \
+        | awk '/BEGIN CERTIFICATE/,/END CERTIFICATE/' > {{ aap_ca_path }}
+      args:
+        creates: "{{ aap_ca_path }}"
+      become: true
+      when: _aap_connect is succeeded
+      register: _aap_cert_export
+      failed_when: false
+      tags: certificates
+
+    - name: Check if AAP certificate was exported
+      ansible.builtin.stat:
+        path: "{{ aap_ca_path }}"
+      register: _aap_cert_stat
+      tags: certificates
+
+    - name: Warn if AAP certificate export failed
+      ansible.builtin.debug:
+        msg: |
+          WARNING: Could not export AAP certificate from {{ gateway_server }}
+          Reason: {{ 'Host unreachable' if _aap_connect is failed else 'Certificate export failed' }}
+          Certificate verification may fail. Consider setting verify_certificates: false
+      when: not _aap_cert_stat.stat.exists
+      tags: certificates
+
+    - name: Update CA trust store
+      ansible.builtin.command: update-ca-trust extract
+      become: true
+      when: _sat_cert_stat.stat.exists or _aap_cert_stat.stat.exists
+      changed_when: true
+      tags: certificates
+
+    - name: Configure foreman.yml inventory plugin
+      ansible.builtin.copy:
+        dest: /etc/ansible/foreman.yml
+        content: |
+          plugin: redhat.satellite.foreman
+          url: https://{{ satellite_host_fqdn }}
+          username: {{ satellite_api_user }}
+          password: {{ satellite_api_password }}
+          validate_certs: {{ _sat_cert_stat.stat.exists | bool }}
+          {{ 'ssl_verify: ' ~ satellite_ca_path if _sat_cert_stat.stat.exists else '# ssl_verify: disabled' }}
+        mode: '0600'
+      become: true
+      no_log: true
+      tags: inventory_plugin
+
+    - name: Authenticate to AAP API
+      ansible.builtin.uri:
+        url: "https://{{ gateway_server }}/api/controller/v2/tokens/"
+        method: POST
+        user: "{{ aap_api_user }}"
+        password: "{{ aap_api_password }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          description: "Integration token created by Ansible ({{ ansible_date_time.iso8601 }})"
+          scope: write
+        status_code: 201
+        validate_certs: "{{ verify_certificates }}"
+      register: _aap_token
+      retries: "{{ api_retry_count }}"
+      delay: "{{ api_retry_delay }}"
+      until: _aap_token.status == 201
+      no_log: true
+      failed_when: false
+      tags: aap_api
+
+    - name: Handle AAP authentication failure
+      block:
+        - name: Debug authentication failure
+          ansible.builtin.debug:
+            msg: |
+              Failed to authenticate to AAP at {{ gateway_server }}
+              Status: {{ _aap_token.status | default('No response') }}
+              Message: {{ _aap_token.msg | default('Unknown error') }}
+              
+              Troubleshooting:
+              1. Verify AAP_API_USER and AAP_API_PASSWORD in {{ env_conf_path }}
+              2. Check AAP is accessible: curl -k https://{{ gateway_server }}/api/controller/v2/ping/
+              3. Verify user has appropriate permissions
+              4. Try setting verify_certificates: false if using self-signed certs
+
+        - name: Fail after authentication troubleshooting info
+          ansible.builtin.fail:
+            msg: "AAP authentication failed. See debug output above."
+      when: _aap_token is failed
+      tags: aap_api
+
+    - name: Lookup Satellite credential type
+      ansible.builtin.uri:
+        url: "https://{{ gateway_server }}/api/controller/v2/credential_types/"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ _aap_token.json.token }}"
+        return_content: true
+        validate_certs: "{{ verify_certificates }}"
+        status_code: 200
+      register: _cred_types
+      retries: "{{ api_retry_count }}"
+      delay: "{{ api_retry_delay }}"
+      until: _cred_types.status == 200
+      tags: aap_api
+
+    - name: Find Red Hat Satellite credential type
+      ansible.builtin.set_fact:
+        _satellite_cred_type: "{{ _cred_types.json.results | selectattr('name', 'search', 'Satellite') | list | first | default(none) }}"
+      tags: aap_api
+
+    - name: Handle missing Satellite credential type
+      block:
+        - name: Display available credential types
+          ansible.builtin.debug:
+            msg: "Available credential types: {{ _cred_types.json.results | map(attribute='name') | list | join(', ') }}"
+
+        - name: Fail with helpful message
+          ansible.builtin.fail:
+            msg: |
+              Red Hat Satellite credential type not found in AAP.
+              This credential type should be available by default in AAP 2.x
+              
+              Please verify:
+              1. AAP version is 2.x or later
+              2. 'redhat.satellite' collection is installed
+              3. Credential type 'Red Hat Satellite 6' exists in AAP UI
+      when: _satellite_cred_type is none
+      tags: aap_api
+
+    - name: Set Satellite credential type ID
+      ansible.builtin.set_fact:
+        _satellite_cred_type_id: "{{ _satellite_cred_type.id }}"
+      when: _satellite_cred_type is not none
+      tags: aap_api
+
+    - name: Create or update Satellite API credential
+      ansible.builtin.uri:
+        url: "https://{{ gateway_server }}/api/controller/v2/credentials/"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ _aap_token.json.token }}"
+        body_format: json
+        body:
+          name: "Satellite API Credential"
+          description: "Auto-configured Satellite credential for inventory sync"
+          credential_type: "{{ _satellite_cred_type_id }}"
+          organization: "{{ organization_id }}"
+          inputs:
+            host: "https://{{ satellite_host_fqdn }}"
+            username: "{{ satellite_api_user }}"
+            password: "{{ satellite_api_password }}"
+        status_code: [201, 400]
+        validate_certs: "{{ verify_certificates }}"
+      register: _sat_cred_create
+      no_log: true
+      tags: aap_api
+
+    - name: Lookup existing Satellite credential on duplicate
+      ansible.builtin.uri:
+        url: "https://{{ gateway_server }}/api/controller/v2/credentials/?name={{ 'Satellite API Credential' | urlencode }}&organization={{ organization_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ _aap_token.json.token }}"
+        return_content: true
+        validate_certs: "{{ verify_certificates }}"
+        status_code: 200
+      register: _sat_cred_lookup
+      when: _sat_cred_create.status == 400
+      tags: aap_api
+
+    - name: Set Satellite credential ID
+      ansible.builtin.set_fact:
+        _satellite_cred_id: "{{ _sat_cred_create.json.id if _sat_cred_create.status == 201 else _sat_cred_lookup.json.results[0].id }}"
+      tags: aap_api
+
+    - name: Display credential creation result
+      ansible.builtin.debug:
+        msg: "Satellite API credential {{ 'created' if _sat_cred_create.status == 201 else 'already exists' }} (ID: {{ _satellite_cred_id }})"
+      tags: aap_api
+
+    - name: Create or update Satellite inventory
+      ansible.builtin.uri:
+        url: "https://{{ gateway_server }}/api/controller/v2/inventories/"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ _aap_token.json.token }}"
+        body_format: json
+        body:
+          name: "Satellite Inventory"
+          description: "Auto-synced inventory from Red Hat Satellite"
+          organization: "{{ organization_id }}"
+        status_code: [201, 400]
+        validate_certs: "{{ verify_certificates }}"
+      register: _sat_inv_create
+      tags: aap_api
+
+    - name: Lookup existing Satellite inventory on duplicate
+      ansible.builtin.uri:
+        url: "https://{{ gateway_server }}/api/controller/v2/inventories/?name={{ 'Satellite Inventory' | urlencode }}&organization={{ organization_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ _aap_token.json.token }}"
+        return_content: true
+        validate_certs: "{{ verify_certificates }}"
+        status_code: 200
+      register: _sat_inv_lookup
+      when: _sat_inv_create.status == 400
+      tags: aap_api
+
+    - name: Set Satellite inventory ID
+      ansible.builtin.set_fact:
+        _satellite_inv_id: "{{ _sat_inv_create.json.id if _sat_inv_create.status == 201 else _sat_inv_lookup.json.results[0].id }}"
+      tags: aap_api
+
+    - name: Display inventory creation result
+      ansible.builtin.debug:
+        msg: "Satellite inventory {{ 'created' if _sat_inv_create.status == 201 else 'already exists' }} (ID: {{ _satellite_inv_id }})"
+      tags: aap_api
+
+    - name: Create or update inventory source
+      ansible.builtin.uri:
+        url: "https://{{ gateway_server }}/api/controller/v2/inventory_sources/"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ _aap_token.json.token }}"
+        body_format: json
+        body:
+          name: "Satellite Source"
+          description: "Red Hat Satellite inventory sync"
+          source: "satellite6"
+          inventory: "{{ _satellite_inv_id }}"
+          credential: "{{ _satellite_cred_id }}"
+          update_on_launch: true
+          update_cache_timeout: 0
+          source_vars: |
+            validate_certs: {{ _sat_cert_stat.stat.exists | bool | lower }}
+        status_code: [201, 400]
+        validate_certs: "{{ verify_certificates }}"
+      register: _sat_source_create
+      tags: aap_api
+
+    - name: Lookup existing inventory source on duplicate
+      ansible.builtin.uri:
+        url: "https://{{ gateway_server }}/api/controller/v2/inventory_sources/?name={{ 'Satellite Source' | urlencode }}&inventory={{ _satellite_inv_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ _aap_token.json.token }}"
+        return_content: true
+        validate_certs: "{{ verify_certificates }}"
+        status_code: 200
+      register: _sat_source_lookup
+      when: _sat_source_create.status == 400
+      tags: aap_api
+
+    - name: Set inventory source ID
+      ansible.builtin.set_fact:
+        _satellite_source_id: "{{ _sat_source_create.json.id if _sat_source_create.status == 201 else _sat_source_lookup.json.results[0].id }}"
+      tags: aap_api
+
+    - name: Update inventory source if settings changed
+      ansible.builtin.uri:
+        url: "https://{{ gateway_server }}/api/controller/v2/inventory_sources/{{ _satellite_source_id }}/"
+        method: PATCH
+        headers:
+          Authorization: "Bearer {{ _aap_token.json.token }}"
+        body_format: json
+        body:
+          credential: "{{ _satellite_cred_id }}"
+          update_on_launch: true
+          source_vars: |
+            validate_certs: {{ _sat_cert_stat.stat.exists | bool | lower }}
+        status_code: 200
+        validate_certs: "{{ verify_certificates }}"
+      when: _sat_source_create.status == 400
+      register: _source_update
+      failed_when: false
+      tags: aap_api
+
+    - name: Display inventory source result
+      ansible.builtin.debug:
+        msg: "Inventory source {{ 'created' if _sat_source_create.status == 201 else 'updated' if (_source_update.status | default(0)) == 200 else 'already exists' }} (ID: {{ _satellite_source_id }})"
+      tags: aap_api
+
+    - name: Trigger inventory sync
+      ansible.builtin.uri:
+        url: "https://{{ gateway_server }}/api/controller/v2/inventory_sources/{{ _satellite_source_id }}/update/"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ _aap_token.json.token }}"
+        status_code: [202, 200]
+        validate_certs: "{{ verify_certificates }}"
+      register: _sync_trigger
+      failed_when: false
+      tags: aap_api, sync
+
+    - name: Display sync trigger result
+      ansible.builtin.debug:
+        msg: |
+          Inventory sync {{ 'initiated successfully' if _sync_trigger.status in [200, 202] else 'FAILED to trigger' }}
+          {% if _sync_trigger.status in [200, 202] %}
+          Monitor progress in AAP UI: https://{{ gateway_server }}/#/jobs/inventory/{{ _sync_trigger.json.inventory_update | default('') }}
+          {% else %}
+          Error: {{ _sync_trigger.msg | default('Unknown error') }}
+          {% endif %}
+      tags: aap_api, sync
+
+    - name: Final integration summary
+      ansible.builtin.debug:
+        msg: |
+          ========================================
+          Satellite-AAP Integration Setup Complete
+          ========================================
+          
+          Satellite: {{ satellite_host_fqdn }}
+          AAP Controller: {{ gateway_server }}
+          Organization: {{ organization_name }} (ID: {{ organization_id }})
+          
+          Created Resources:
+          - Credential: Satellite API Credential (ID: {{ _satellite_cred_id }})
+          - Inventory: Satellite Inventory (ID: {{ _satellite_inv_id }})
+          - Source: Satellite Source (ID: {{ _satellite_source_id }})
+          
+          Certificate Status:
+          - Satellite CA: {{ 'exported' if _sat_cert_stat.stat.exists else 'not available' }}
+          - AAP CA: {{ 'exported' if _aap_cert_stat.stat.exists else 'not available' }}
+          
+          Next Steps:
+          1. Verify inventory sync in AAP UI
+          2. Check hosts appear in Satellite Inventory
+          3. Configure job templates to use this inventory
+          
+          Troubleshooting:
+          - View logs: journalctl -u automation-controller
+          - Test Satellite API: curl -k -u {{ satellite_api_user }}:*** https://{{ satellite_host_fqdn }}/api/v2/hosts
+          - AAP docs: https://{{ gateway_server }}/api/controller/v2/
+      tags: always

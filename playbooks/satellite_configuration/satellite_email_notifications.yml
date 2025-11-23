@@ -1,0 +1,533 @@
+---
+# Satellite Email Notifications
+# Synopsis: Configures Satellite email delivery (Postfix + optional Gmail fallback) and supports send/verify operations for notification workflows.
+# Configure email server and send notifications
+# Compatible with Ansible Automation Platform 2.6
+#
+# OPERATIONS:
+#   - configure: Configure mail server (Postfix) with SMTP relay
+#   - send: Send test email notification
+#   - verify: Verify email configuration
+#
+# USAGE:
+#   ansible-playbook satellite_email_notifications.yml \
+#     -e operation=configure \
+#     -e smtp_host=smtp.prod.spg \
+#     -e smtp_account=admin@prod.spg
+
+- name: Satellite Email Notifications
+  hosts: satellite
+  gather_facts: true
+  become: true
+  
+  vars:
+    # Operation to perform
+    operation: "{{ operation | default('') }}"
+    
+    # Primary SMTP Configuration
+    smtp_host: "{{ smtp_host | default('localhost') }}"
+    smtp_port: "{{ smtp_port | default(587) }}"
+    smtp_account: "{{ smtp_account | default('admin@prod.spg') }}"
+    smtp_account_password: "{{ smtp_account_password | default(lookup('env', 'SMTP_PASSWORD')) }}"
+    smtp_use_tls: "{{ smtp_use_tls | default(true) }}"
+    smtp_from_email: "{{ smtp_from_email | default(smtp_account) }}"
+    smtp_to_emails: "{{ smtp_to_emails | default(['admin@prod.spg']) }}"
+    
+    # Gmail Fallback Configuration
+    gmail_enabled: "{{ gmail_enabled | default(false) }}"
+    gmail_smtp_host: "{{ gmail_smtp_host | default('smtp.gmail.com') }}"
+    gmail_smtp_port: "{{ gmail_smtp_port | default(587) }}"
+    gmail_account: "{{ gmail_account | default('') }}"
+    gmail_password: "{{ gmail_password | default(lookup('env', 'GMAIL_PASSWORD')) }}"
+    
+    # Email Content
+    email_subject: "{{ email_subject | default('Satellite Notification') }}"
+    email_body: "{{ email_body | default('This is a test notification from Satellite server at ' + inventory_hostname) }}"
+    email_html_body: "{{ email_html_body | default('<h1>Satellite Notification</h1><p>' + email_body + '</p>') }}"
+    
+    # Configuration
+    postfix_main_cf: /etc/postfix/main.cf
+    postfix_sasl_passwd: /etc/postfix/sasl_passwd
+
+  pre_tasks:
+    - name: Validate operation parameter
+      ansible.builtin.assert:
+        that:
+          - operation is defined
+          - operation in ['configure', 'send', 'verify']
+        fail_msg: |
+          Invalid operation. Must be one of:
+          - configure (setup mail server)
+          - send (send test email)
+          - verify (check configuration)
+        success_msg: "Operation validated: {{ operation }}"
+      tags: always
+
+    - name: Validate SMTP credentials for configure/send
+      ansible.builtin.assert:
+        that:
+          - smtp_account_password | length > 0
+        fail_msg: "SMTP password required. Set via -e smtp_account_password=PASSWORD or export SMTP_PASSWORD=password"
+        success_msg: "SMTP credentials present"
+      no_log: true
+      when: operation in ['configure', 'send']
+      tags: always
+
+    - name: Validate email recipients for send operation
+      ansible.builtin.assert:
+        that:
+          - smtp_to_emails is defined
+          - smtp_to_emails | length > 0
+        fail_msg: "At least one recipient email required. Set via -e smtp_to_emails=['email@domain.com']"
+        success_msg: "Recipients configured: {{ smtp_to_emails | length }}"
+      when: operation == 'send'
+      tags: always
+
+  tasks:
+    # ========================================
+    # CONFIGURE OPERATION
+    # ========================================
+    
+    - name: Configure - Install mail server packages
+      ansible.builtin.yum:
+        name:
+          - postfix
+          - mailx
+          - cyrus-sasl-plain
+        state: present
+      when: operation == 'configure'
+      tags:
+        - configure
+
+    - name: Configure - Backup existing Postfix configuration
+      ansible.builtin.copy:
+        src: "{{ postfix_main_cf }}"
+        dest: "{{ postfix_main_cf }}.backup.{{ ansible_date_time.epoch }}"
+        remote_src: true
+        mode: preserve
+      when:
+        - operation == 'configure'
+      failed_when: false
+      tags:
+        - configure
+
+    - name: Configure - Set Postfix relay host
+      ansible.builtin.lineinfile:
+        path: "{{ postfix_main_cf }}"
+        regexp: '^relayhost\s*='
+        line: "relayhost = [{{ smtp_host }}]:{{ smtp_port }}"
+        create: false
+      when: operation == 'configure'
+      notify: restart postfix
+      tags:
+        - configure
+
+    - name: Configure - Enable SMTP TLS
+      ansible.builtin.lineinfile:
+        path: "{{ postfix_main_cf }}"
+        regexp: '^smtp_use_tls\s*='
+        line: "smtp_use_tls = {{ 'yes' if smtp_use_tls else 'no' }}"
+        create: false
+      when: operation == 'configure'
+      notify: restart postfix
+      tags:
+        - configure
+
+    - name: Configure - Enable SASL authentication
+      ansible.builtin.lineinfile:
+        path: "{{ postfix_main_cf }}"
+        regexp: '^{{ item.key }}\s*='
+        line: "{{ item.key }} = {{ item.value }}"
+        create: false
+      loop:
+        - { key: 'smtp_sasl_auth_enable', value: 'yes' }
+        - { key: 'smtp_sasl_password_maps', value: 'hash:/etc/postfix/sasl_passwd' }
+        - { key: 'smtp_sasl_security_options', value: 'noanonymous' }
+        - { key: 'smtp_sasl_tls_security_options', value: 'noanonymous' }
+      when: operation == 'configure'
+      notify: restart postfix
+      tags:
+        - configure
+
+    - name: Configure - Create SASL password file
+      ansible.builtin.copy:
+        content: |
+          [{{ smtp_host }}]:{{ smtp_port }} {{ smtp_account }}:{{ smtp_account_password }}
+        dest: "{{ postfix_sasl_passwd }}"
+        mode: '0600'
+        owner: root
+        group: root
+      when: operation == 'configure'
+      no_log: true
+      notify: rebuild postfix maps
+      tags:
+        - configure
+
+    - name: Configure - Generate hash db for SASL password
+      ansible.builtin.command:
+        cmd: postmap {{ postfix_sasl_passwd }}
+      when: operation == 'configure'
+      changed_when: true
+      tags:
+        - configure
+
+    - name: Configure - Ensure Postfix is enabled and started
+      ansible.builtin.systemd:
+        name: postfix
+        state: started
+        enabled: true
+      when: operation == 'configure'
+      tags:
+        - configure
+
+    - name: Configure - Verify Postfix is running
+      ansible.builtin.systemd:
+        name: postfix
+      register: _postfix_status
+      when: operation == 'configure'
+      tags:
+        - configure
+
+    - name: Configure - Display configuration summary
+      ansible.builtin.debug:
+        msg: |
+          ==========================================
+          MAIL SERVER CONFIGURATION COMPLETE
+          ==========================================
+          
+          SMTP Configuration:
+          - Relay Host: {{ smtp_host }}:{{ smtp_port }}
+          - Account: {{ smtp_account }}
+          - TLS Enabled: {{ smtp_use_tls }}
+          - From Address: {{ smtp_from_email }}
+          
+          Postfix Status: {{ _postfix_status.status.ActiveState | default('Unknown') }}
+          
+          Configuration Files:
+          - Main Config: {{ postfix_main_cf }}
+          - SASL Password: {{ postfix_sasl_passwd }}
+          - Backup: {{ postfix_main_cf }}.backup.{{ ansible_date_time.epoch }}
+          
+          Next Steps:
+          1. Test configuration: ansible-playbook satellite_email_notifications.yml -e operation=verify
+          2. Send test email: ansible-playbook satellite_email_notifications.yml -e operation=send
+          
+          Troubleshooting:
+          - Check logs: tail -f /var/log/maillog
+          - Test SMTP: telnet {{ smtp_host }} {{ smtp_port }}
+          - Verify auth: postconf smtp_sasl_auth_enable
+          ==========================================
+      when: operation == 'configure'
+      tags:
+        - configure
+
+    # ========================================
+    # SEND OPERATION
+    # ========================================
+    
+    - name: Send - Verify Postfix is running
+      ansible.builtin.systemd:
+        name: postfix
+      register: _postfix_running
+      failed_when: false
+      when: operation == 'send'
+      tags:
+        - send
+
+    - name: Send - Warn if Postfix not running
+      ansible.builtin.debug:
+        msg: |
+          WARNING: Postfix is not running
+          Run: ansible-playbook satellite_email_notifications.yml -e operation=configure
+      when:
+        - operation == 'send'
+        - _postfix_running.status.ActiveState != 'active'
+      tags:
+        - send
+
+    - name: Send - Send email via Ansible mail module
+      community.general.mail:
+        host: "{{ smtp_host }}"
+        port: "{{ smtp_port }}"
+        username: "{{ smtp_account }}"
+        password: "{{ smtp_account_password }}"
+        to: "{{ smtp_to_emails }}"
+        from: "{{ smtp_from_email }}"
+        subject: "{{ email_subject }}"
+        body: "{{ email_html_body }}"
+        subtype: html
+        secure: "{{ 'starttls' if smtp_use_tls else 'never' }}"
+        charset: utf-8
+      delegate_to: localhost
+      become: false
+      register: _mail_result
+      when: operation == 'send'
+      failed_when: false
+      no_log: true
+      tags:
+        - send
+
+    - name: Send - Try Gmail fallback if primary fails
+      community.general.mail:
+        host: "{{ gmail_smtp_host }}"
+        port: "{{ gmail_smtp_port }}"
+        username: "{{ gmail_account }}"
+        password: "{{ gmail_password }}"
+        to: "{{ smtp_to_emails }}"
+        from: "{{ gmail_account }}"
+        subject: "[FALLBACK] {{ email_subject }}"
+        body: "{{ email_html_body }}"
+        subtype: html
+        secure: starttls
+        charset: utf-8
+      delegate_to: localhost
+      become: false
+      register: _gmail_result
+      when:
+        - operation == 'send'
+        - _mail_result is failed
+        - gmail_enabled
+        - gmail_account | length > 0
+        - gmail_password | length > 0
+      failed_when: false
+      no_log: true
+      tags:
+        - send
+
+    - name: Send - Try local mail command as last resort
+      ansible.builtin.shell:
+        cmd: |
+          echo "{{ email_body }}" | mail -s "{{ email_subject }}" {{ smtp_to_emails | join(' ') }}
+      register: _mail_cmd_result
+      when:
+        - operation == 'send'
+        - _mail_result is failed
+        - (_gmail_result is not defined or _gmail_result is failed)
+      failed_when: false
+      changed_when: _mail_cmd_result.rc == 0
+      tags:
+        - send
+
+    - name: Send - Display send results
+      ansible.builtin.debug:
+        msg: |
+          ==========================================
+          EMAIL SEND RESULTS
+          ==========================================
+          
+          {% if _mail_result is succeeded %}
+          Primary SMTP: SUCCESS
+          - Sent to: {{ smtp_to_emails | join(', ') }}
+          - From: {{ smtp_from_email }}
+          - Subject: {{ email_subject }}
+          {% elif _mail_result is failed %}
+          Primary SMTP: FAILED
+          - Error: {{ _mail_result.msg | default('Unknown error') }}
+          
+          {% if _gmail_result is defined and _gmail_result is succeeded %}
+          Gmail Fallback: SUCCESS
+          - Sent to: {{ smtp_to_emails | join(', ') }}
+          - From: {{ gmail_account }}
+          {% elif _gmail_result is defined and _gmail_result is failed %}
+          Gmail Fallback: FAILED
+          - Error: {{ _gmail_result.msg | default('Unknown error') }}
+          {% endif %}
+          
+          {% if _mail_cmd_result is defined and _mail_cmd_result is succeeded %}
+          Local Mail Command: SUCCESS
+          - Sent to: {{ smtp_to_emails | join(', ') }}
+          {% elif _mail_cmd_result is defined and _mail_cmd_result is failed %}
+          Local Mail Command: FAILED
+          - Error: {{ _mail_cmd_result.stderr | default('Unknown error') }}
+          {% endif %}
+          {% endif %}
+          
+          Troubleshooting:
+          {% if _mail_result is failed %}
+          1. Check SMTP credentials and host
+          2. Verify firewall allows outbound port {{ smtp_port }}
+          3. Check Postfix logs: tail -f /var/log/maillog
+          4. Test SMTP auth: swaks --to test@example.com --server {{ smtp_host }}:{{ smtp_port }} --auth LOGIN --auth-user {{ smtp_account }}
+          {% endif %}
+          ==========================================
+      when: operation == 'send'
+      tags:
+        - send
+
+    # ========================================
+    # VERIFY OPERATION
+    # ========================================
+    
+    - name: Verify - Check Postfix service
+      ansible.builtin.systemd:
+        name: postfix
+      register: _verify_postfix
+      failed_when: false
+      when: operation == 'verify'
+      tags:
+        - verify
+
+    - name: Verify - Check mail packages
+      ansible.builtin.package_facts:
+        manager: auto
+      when: operation == 'verify'
+      tags:
+        - verify
+
+    - name: Verify - Check required packages
+      ansible.builtin.set_fact:
+        _mail_packages:
+          postfix: "{{ 'postfix' in ansible_facts.packages }}"
+          mailx: "{{ 'mailx' in ansible_facts.packages }}"
+          sasl: "{{ 'cyrus-sasl-plain' in ansible_facts.packages }}"
+      when: operation == 'verify'
+      tags:
+        - verify
+
+    - name: Verify - Read Postfix configuration
+      ansible.builtin.slurp:
+        src: "{{ postfix_main_cf }}"
+      register: _postfix_config
+      when: operation == 'verify'
+      failed_when: false
+      tags:
+        - verify
+
+    - name: Verify - Parse Postfix settings
+      ansible.builtin.set_fact:
+        _postfix_settings:
+          relayhost: "{{ _postfix_config.content | b64decode | regex_search('^relayhost\\s*=\\s*(.+)$', '\\1', multiline=True) | first | default('NOT SET') }}"
+          smtp_use_tls: "{{ _postfix_config.content | b64decode | regex_search('^smtp_use_tls\\s*=\\s*(.+)$', '\\1', multiline=True) | first | default('NOT SET') }}"
+          smtp_sasl_auth_enable: "{{ _postfix_config.content | b64decode | regex_search('^smtp_sasl_auth_enable\\s*=\\s*(.+)$', '\\1', multiline=True) | first | default('NOT SET') }}"
+      when:
+        - operation == 'verify'
+        - _postfix_config is succeeded
+      tags:
+        - verify
+
+    - name: Verify - Check SASL password file
+      ansible.builtin.stat:
+        path: "{{ postfix_sasl_passwd }}"
+      register: _sasl_passwd_stat
+      when: operation == 'verify'
+      tags:
+        - verify
+
+    - name: Verify - Check SASL password database
+      ansible.builtin.stat:
+        path: "{{ postfix_sasl_passwd }}.db"
+      register: _sasl_passwd_db_stat
+      when: operation == 'verify'
+      tags:
+        - verify
+
+    - name: Verify - Check mail queue
+      ansible.builtin.command:
+        cmd: mailq
+      register: _mail_queue
+      changed_when: false
+      failed_when: false
+      when: operation == 'verify'
+      tags:
+        - verify
+
+    - name: Verify - Count queued messages
+      ansible.builtin.set_fact:
+        _queue_count: "{{ _mail_queue.stdout | regex_findall('^[A-F0-9]+\\s', multiline=True) | length }}"
+      when:
+        - operation == 'verify'
+        - _mail_queue is succeeded
+      tags:
+        - verify
+
+    - name: Verify - Check recent mail log
+      ansible.builtin.shell:
+        cmd: tail -20 /var/log/maillog 2>/dev/null || echo "No mail log found"
+      register: _mail_log
+      changed_when: false
+      when: operation == 'verify'
+      tags:
+        - verify
+
+    - name: Verify - Display verification results
+      ansible.builtin.debug:
+        msg: |
+          ==========================================
+          EMAIL CONFIGURATION VERIFICATION
+          ==========================================
+          
+          Postfix Service:
+          - Status: {{ _verify_postfix.status.ActiveState | default('NOT RUNNING') }}
+          - Enabled: {{ _verify_postfix.status.UnitFileState | default('Unknown') }}
+          
+          Required Packages:
+          - postfix: {{ 'INSTALLED' if _mail_packages.postfix else 'NOT INSTALLED' }}
+          - mailx: {{ 'INSTALLED' if _mail_packages.mailx else 'NOT INSTALLED' }}
+          - cyrus-sasl-plain: {{ 'INSTALLED' if _mail_packages.sasl else 'NOT INSTALLED' }}
+          
+          Postfix Configuration:
+          {% if _postfix_settings is defined %}
+          - Relay Host: {{ _postfix_settings.relayhost }}
+          - TLS Enabled: {{ _postfix_settings.smtp_use_tls }}
+          - SASL Auth: {{ _postfix_settings.smtp_sasl_auth_enable }}
+          {% else %}
+          - Configuration file not readable
+          {% endif %}
+          
+          SASL Authentication:
+          - Password File: {{ 'EXISTS' if _sasl_passwd_stat.stat.exists else 'MISSING' }}
+          - Password DB: {{ 'EXISTS' if _sasl_passwd_db_stat.stat.exists else 'MISSING' }}
+          
+          Mail Queue:
+          - Messages in Queue: {{ _queue_count | default('Unknown') }}
+          {% if _queue_count | default(0) | int > 0 %}
+          - WARNING: Messages are stuck in queue
+          {% endif %}
+          
+          Recent Log Activity:
+          {{ _mail_log.stdout_lines | default(['No logs available']) | join('\n') | indent(2) }}
+          
+          Overall Status: {{ 'CONFIGURED' if (_verify_postfix.status.ActiveState == 'active' and _sasl_passwd_db_stat.stat.exists) else 'NOT CONFIGURED' }}
+          
+          {% if _verify_postfix.status.ActiveState != 'active' or not _sasl_passwd_db_stat.stat.exists %}
+          Action Required:
+          - Run: ansible-playbook satellite_email_notifications.yml -e operation=configure
+          {% else %}
+          Configuration looks good. Send a test email:
+          - Run: ansible-playbook satellite_email_notifications.yml -e operation=send -e smtp_to_emails=['your@email.com']
+          {% endif %}
+          ==========================================
+      when: operation == 'verify'
+      tags:
+        - verify
+
+  handlers:
+    - name: restart postfix
+      ansible.builtin.systemd:
+        name: postfix
+        state: restarted
+
+    - name: rebuild postfix maps
+      ansible.builtin.command:
+        cmd: postmap {{ postfix_sasl_passwd }}
+      changed_when: true
+
+  post_tasks:
+    - name: Operation complete
+      ansible.builtin.debug:
+        msg: |
+          ==========================================
+          OPERATION COMPLETE: {{ operation }}
+          ==========================================
+          
+          {% if operation == 'configure' %}
+          Mail server configured. Test with: -e operation=send
+          {% elif operation == 'send' %}
+          Email sent. Check recipient inbox.
+          {% elif operation == 'verify' %}
+          Verification complete. Review output above.
+          {% endif %}
+          
+          For help, see README.md in this directory.
+          ==========================================
+      tags: always

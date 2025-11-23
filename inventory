@@ -1,5 +1,9 @@
 [satellite]
-satellite.prod.spg ansible_host=10.168.151.127
+satellite.prod.spg ansible_host=10.168.151.127 ansible_connection=ssh ansible_user=root
+
+[kvm]
+# Running directly on KVM host (kaso), no SSH needed, no sudo (NFS nosuid blocks sudo)
+kaso.prod.spg ansible_host=10.168.0.1 ansible_connection=local ansible_become=false
 
 [ansible]
 ansible.prod.spg ansible_host=10.168.151.126

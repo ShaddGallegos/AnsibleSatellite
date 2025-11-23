@@ -1,0 +1,185 @@
+---
+# Associate a provisioning template as the default 'provision' template for a specific OS
+# Synopsis: Maps a named provisioning template as the default 'provision' template for a target RHEL OS (major/minor) and ensures OS association on the template.
+# Uses Satellite/Foreman REST API. Idempotent.
+#
+# Usage:
+#   SATELLITE_PASSWORD='...' ansible-playbook associate_template_to_os.yml \
+#     -e satellite_username=admin -e os_major=9 -e os_minor=7 \
+#     -e template_name="RHEL 9.7 x86_64 Post-Kickstart Default"
+
+- name: Associate provisioning template to OS as default
+  hosts: localhost
+  gather_facts: false
+  connection: local
+
+  vars:
+    satellite_url: "https://satellite.prod.spg"
+    satellite_username: "{{ satellite_username | default('admin') }}"
+    satellite_password: "{{ satellite_password | default(lookup('env','SATELLITE_PASSWORD')) }}"
+    template_name: "{{ template_name | default('RHEL 9.7 x86_64 Post-Kickstart Default') }}"
+    os_major: "{{ os_major | default('9') }}"
+    os_minor: "{{ os_minor | default('7') }}"
+    validate_certs: false
+
+  tasks:
+    - name: Fail fast if password not provided
+      ansible.builtin.fail:
+        msg: "satellite_password not supplied (set SATELLITE_PASSWORD env var or -e satellite_password=...)"
+      when: satellite_password | default('') | length == 0
+
+    - name: Lookup RHEL OS matching major/minor
+      ansible.builtin.uri:
+        url: "{{ satellite_url }}/api/v2/operatingsystems?per_page=1000"
+        method: GET
+        user: "{{ satellite_username }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ validate_certs }}"
+        status_code: 200
+      register: _os_list
+      no_log: true
+
+    - name: Determine OS id (prefer exact minor match, fallback to major only)
+      ansible.builtin.set_fact:
+        _os_exact: "{{ (_os_list.json.results | selectattr('name','search','Red') | selectattr('major','equalto', (os_major | string)) | selectattr('minor','equalto', (os_minor | string)) | list) }}"
+        _os_major_only: "{{ (_os_list.json.results | selectattr('name','search','Red') | selectattr('major','equalto', (os_major | string)) | list) }}"
+
+    - name: Choose OS candidate and id
+      ansible.builtin.set_fact:
+        _os: "{{ (_os_exact | first) if (_os_exact | length > 0) else (_os_major_only | first) }}"
+        _os_id: "{{ ((_os_exact | first).id if (_os_exact | length > 0) else (_os_major_only | first).id) | default(None) }}"
+
+    - name: Fail if no OS found
+      ansible.builtin.fail:
+        msg: "Could not find RHEL OS for major={{ os_major }} minor={{ os_minor }} (tried exact and major-only)"
+      when: _os_id is not defined or _os_id is none
+
+    - name: Lookup provisioning template by name
+      ansible.builtin.uri:
+        url: "{{ satellite_url }}/api/v2/provisioning_templates?search=name=\"{{ template_name | urlencode }}\""
+        method: GET
+        user: "{{ satellite_username }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ validate_certs }}"
+        status_code: 200
+      register: _tpl_search
+      no_log: true
+
+    - name: Extract template id
+      ansible.builtin.set_fact:
+        _tpl_id: "{{ (_tpl_search.json.results | selectattr('name','equalto', template_name) | map(attribute='id') | list | first) | default(None) }}"
+
+    - name: Fail if template not found
+      ansible.builtin.fail:
+        msg: "Provisioning template '{{ template_name }}' not found on Satellite. Run push_provisioning_template.yml first."
+      when: _tpl_id is none
+
+    - name: Lookup template_kind id for 'provision'
+      ansible.builtin.uri:
+        url: "{{ satellite_url }}/api/v2/template_kinds?per_page=1000"
+        method: GET
+        user: "{{ satellite_username }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ validate_certs }}"
+        status_code: 200
+      register: _kinds
+      no_log: true
+
+    - name: Extract provision kind id
+      ansible.builtin.set_fact:
+        _kind_id: "{{ (_kinds.json.results | selectattr('name','equalto','provision') | map(attribute='id') | list | first) | default(None) }}"
+
+    - name: Fail if provision kind not found
+      ansible.builtin.fail:
+        msg: "Template kind 'provision' not found"
+      when: _kind_id is none
+
+    - name: Get existing OS default templates
+      ansible.builtin.uri:
+        url: "{{ satellite_url }}/api/v2/operatingsystems/{{ _os_id }}/os_default_templates?per_page=1000"
+        method: GET
+        user: "{{ satellite_username }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ validate_certs }}"
+        status_code: 200
+      register: _os_defaults
+      no_log: true
+
+    - name: Find existing 'provision' default mapping
+      ansible.builtin.set_fact:
+        _existing_default: "{{ (_os_defaults.json.results | selectattr('template_kind_id','equalto', _kind_id) | list | first) | default(None) }}"
+
+    - name: Create OS default template mapping if missing
+      ansible.builtin.uri:
+        url: "{{ satellite_url }}/api/v2/operatingsystems/{{ _os_id }}/os_default_templates"
+        method: POST
+        user: "{{ satellite_username }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ validate_certs }}"
+        status_code: [201]
+        body_format: json
+        body:
+          os_default_template:
+            template_id: "{{ _tpl_id }}"
+            template_kind_id: "{{ _kind_id }}"
+      register: _created_default
+      when: _existing_default is none
+      no_log: true
+
+    - name: Update existing OS default template mapping if different
+      ansible.builtin.uri:
+        url: "{{ satellite_url }}/api/v2/os_default_templates/{{ _existing_default.id }}"
+        method: PUT
+        user: "{{ satellite_username }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ validate_certs }}"
+        status_code: [200]
+        body_format: json
+        body:
+          os_default_template:
+            template_id: "{{ _tpl_id }}"
+            template_kind_id: "{{ _kind_id }}"
+      register: _updated_default
+      when: _existing_default is not none and _existing_default.template_id != _tpl_id
+      no_log: true
+
+    - name: Ensure template includes the OS association (append if needed)
+      ansible.builtin.uri:
+        url: "{{ satellite_url }}/api/v2/provisioning_templates/{{ _tpl_id }}"
+        method: GET
+        user: "{{ satellite_username }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ validate_certs }}"
+        status_code: 200
+      register: _tpl_details
+      no_log: true
+
+    - name: Patch template with OS association if missing
+      ansible.builtin.uri:
+        url: "{{ satellite_url }}/api/v2/provisioning_templates/{{ _tpl_id }}"
+        method: PUT
+        user: "{{ satellite_username }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ validate_certs }}"
+        status_code: [200]
+        body_format: json
+        body:
+          provisioning_template:
+            operatingsystem_ids: "{{ (_tpl_details.json.operatingsystems | map(attribute='id') | list + [_os_id] | unique) }}"
+      when: _os_id not in (_tpl_details.json.operatingsystems | map(attribute='id') | list)
+      no_log: true
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg: |
+          Associated template '{{ template_name }}' (id={{ _tpl_id }}) as default 'provision' for OS id={{ _os_id }}.
+          Created mapping: {{ _created_default is defined }}
+          Updated mapping: {{ _updated_default is defined }}

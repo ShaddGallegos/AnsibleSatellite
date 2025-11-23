@@ -1,0 +1,453 @@
+---
+# Consolidated playbook for configuring AAP Controller job templates
+# Synopsis: Automates creation/update of AAP Controller job templates, inventories, and surveys using Controller API with multi-auth and enhanced error handling.
+# Improved error handling, authentication methods, and survey configuration
+# Supports OAuth tokens, username/password, and environment variables
+
+- name: Configure AAP Controller Job Templates
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  
+  vars:
+    # Controller connection - can be overridden via extra-vars or controller_vars.yml
+    controller_host: "https://aap-controller.example.com"
+    controller_oauthtoken: ""
+    controller_username: ""
+    controller_password: ""
+    controller_verify_ssl: true
+    
+    # Organization and project
+    organization_name: "Default"
+    project_name: "AnsibleLaunchPad"
+    
+    # Inventory and credentials
+    inventory_name: "Satellite Inventory"
+    credential_name: ""
+    execution_environment: ""
+    
+    # Retry configuration
+    api_retry_count: 3
+    api_retry_delay: 5
+    
+    # Job templates to create
+    job_templates:
+      - name: "Build Nodes in Batches"
+        description: "Create multiple batches of 5 nodes each using Satellite Compute hostgroup"
+        playbook: "AnsibleSatellite/playbooks/node_provisioning/build_nodes_in_batches.yml"
+        survey_enabled: true
+        survey_spec:
+          name: "Node Batch Creation Survey"
+          description: "Configure batch node provisioning settings"
+          spec:
+            - question_name: "How many batches to create? (each batch = 5 nodes)"
+              question_description: "Total nodes will be iterations × 5"
+              required: true
+              type: "integer"
+              variable: "iterations"
+              min: 1
+              max: 100
+              default: 1
+            - question_name: "Node name prefix"
+              question_description: "Prefix for node names (e.g., 'node' creates node001, node002, etc.)"
+              required: true
+              type: "text"
+              variable: "node_prefix"
+              default: "node"
+            - question_name: "Satellite Organization"
+              required: true
+              type: "text"
+              variable: "org"
+              default: "RedHat"
+            - question_name: "Satellite Location"
+              required: true
+              type: "text"
+              variable: "location"
+              default: "Denver"
+            - question_name: "Satellite Hostgroup"
+              required: true
+              type: "text"
+              variable: "hostgroup"
+              default: "Compute"
+            - question_name: "Delay between nodes (seconds)"
+              required: true
+              type: "integer"
+              variable: "delay_seconds"
+              min: 0
+              max: 3600
+              default: 30
+            - question_name: "Delay between batches (seconds)"
+              required: true
+              type: "integer"
+              variable: "delay_between_batches"
+              min: 0
+              max: 7200
+              default: 60
+      
+      - name: "Create Single PXE Node"
+        description: "Create a single PXE-bootable node in Satellite"
+        playbook: "AnsibleSatellite/playbooks/node_provisioning/create_pxe_node.yml"
+        survey_enabled: true
+        survey_spec:
+          name: "Single Node Creation Survey"
+          description: "Configure single node creation"
+          spec:
+            - question_name: "Node number (001-999)"
+              required: true
+              type: "integer"
+              variable: "node_number"
+              min: 1
+              max: 999
+              default: 1
+            - question_name: "Domain name"
+              required: true
+              type: "text"
+              variable: "domain"
+              default: "prod.spg"
+            - question_name: "Operating System ID"
+              required: false
+              type: "integer"
+              variable: "os_id"
+              min: 1
+              max: 999
+              default: 1
+            - question_name: "Hostgroup ID"
+              required: false
+              type: "integer"
+              variable: "hostgroup_id"
+              min: 1
+              max: 999
+              default: 1
+      
+      - name: "Bulk Create PXE Nodes"
+        description: "Create multiple consecutive PXE nodes with automatic slot allocation"
+        playbook: "AnsibleSatellite/playbooks/node_provisioning/bulk_create_pxe_nodes.yml"
+        survey_enabled: true
+        survey_spec:
+          name: "Bulk Node Creation Survey"
+          description: "Create multiple nodes in consecutive order"
+          spec:
+            - question_name: "How many nodes to create?"
+              required: true
+              type: "integer"
+              variable: "nodes_to_install"
+              min: 1
+              max: 100
+              default: 5
+            - question_name: "Domain name"
+              required: true
+              type: "text"
+              variable: "domain"
+              default: "prod.spg"
+            - question_name: "Maximum scheduled jobs (AAP capacity)"
+              required: false
+              type: "integer"
+              variable: "maximum_scheduled_jobs"
+              min: 1
+              max: 100
+              default: 10
+      
+      - name: "Delete PXE Node"
+        description: "Remove a node from Satellite and clean up resources"
+        playbook: "AnsibleSatellite/playbooks/node_provisioning/delete_pxe_node.yml"
+        survey_enabled: true
+        survey_spec:
+          name: "Node Deletion Survey"
+          description: "Select node to delete"
+          spec:
+            - question_name: "Node number to delete (001-999)"
+              required: true
+              type: "integer"
+              variable: "node_number"
+              min: 1
+              max: 999
+      
+      - name: "List PXE Nodes"
+        description: "Display all PXE nodes and available slots"
+        playbook: "AnsibleSatellite/playbooks/node_provisioning/list_pxe_nodes.yml"
+        survey_enabled: false
+      
+      - name: "PXE Boot Remediation"
+        description: "Fix PXE boot issues with automatic boot file resolution"
+        playbook: "AnsibleSatellite/playbooks/node_provisioning/pxe_boot_remediate.yml"
+        survey_enabled: true
+        survey_spec:
+          name: "PXE Remediation Survey"
+          description: "Specify node and VM details"
+          spec:
+            - question_name: "Satellite hostname (FQDN)"
+              required: true
+              type: "text"
+              variable: "host_name"
+              default: "node001.prod.spg"
+            - question_name: "Libvirt VM name"
+              required: true
+              type: "text"
+              variable: "vm_name"
+            - question_name: "KVM URI"
+              required: false
+              type: "text"
+              variable: "kvm_uri"
+              default: "qemu:///system"
+      
+      - name: "Satellite Health Check"
+        description: "Comprehensive Satellite server health check"
+        playbook: "AnsibleSatellite/playbooks/satellite_configuration/satellite_health_check.yml"
+        survey_enabled: false
+      
+      - name: "Backup Satellite Configuration"
+        description: "Backup Satellite configs, certs, and settings"
+        playbook: "AnsibleSatellite/playbooks/satellite_configuration/satellite_config_backup.yml"
+        survey_enabled: false
+      
+      - name: "Cleanup Orphaned Disks"
+        description: "Remove orphaned VM disk volumes from libvirt"
+        playbook: "AnsibleSatellite/playbooks/libvirt_configuration/cleanup_orphaned_disks.yml"
+        survey_enabled: false
+
+  pre_tasks:
+    - name: Load controller_vars.yml if it exists
+      block:
+        - name: Check for controller_vars.yml
+          ansible.builtin.stat:
+            path: "{{ playbook_dir }}/controller_vars.yml"
+          register: _controller_vars_file
+
+        - name: Load controller variables from file
+          ansible.builtin.include_vars:
+            file: "{{ playbook_dir }}/controller_vars.yml"
+          when: _controller_vars_file.stat.exists
+      tags: always
+
+    - name: Normalize authentication credentials
+      ansible.builtin.set_fact:
+        _controller_token: "{{ controller_oauthtoken | default(lookup('env', 'CONTROLLER_OAUTH_TOKEN'), true) | default('', true) }}"
+        _controller_username: "{{ controller_username | default(lookup('env', 'CONTROLLER_USERNAME'), true) | default('', true) }}"
+        _controller_password: "{{ controller_password | default(lookup('env', 'CONTROLLER_PASSWORD'), true) | default('', true) }}"
+      no_log: true
+      tags: always
+
+    - name: Interactive credential prompt (if no auth provided)
+      block:
+        - name: Prompt for Controller username
+          ansible.builtin.pause:
+            prompt: "Enter AAP Controller username"
+          register: _prompt_username
+          when: _controller_token | length == 0 and _controller_username | length == 0
+
+        - name: Prompt for Controller password
+          ansible.builtin.pause:
+            prompt: "Enter AAP Controller password"
+            echo: false
+          register: _prompt_password
+          when: _controller_token | length == 0 and _controller_username | length == 0
+
+        - name: Set prompted credentials
+          ansible.builtin.set_fact:
+            _controller_username: "{{ _prompt_username.user_input | default(_controller_username) }}"
+            _controller_password: "{{ _prompt_password.user_input | default(_controller_password) }}"
+          no_log: true
+          when:
+            - _controller_token | length == 0
+            - _prompt_username.user_input is defined
+      when: _controller_token | length == 0 and _controller_username | length == 0
+      tags: always
+
+    - name: Validate authentication method available
+      ansible.builtin.assert:
+        that:
+          - _controller_token | length > 0 or (_controller_username | length > 0 and _controller_password | length > 0)
+        fail_msg: |
+          No valid authentication method provided.
+          
+          Provide one of:
+          1. OAuth Token: -e controller_oauthtoken=TOKEN or export CONTROLLER_OAUTH_TOKEN=TOKEN
+          2. Username/Password: -e controller_username=USER controller_password=PASS
+          3. controller_vars.yml file in playbook directory
+          4. Interactive prompt (run without credentials)
+          
+          To generate OAuth token in AAP:
+          - Navigate to: https://{{ controller_host }}/#/users/<username>/tokens
+          - Create new token with 'Write' scope
+        success_msg: "Authentication credentials validated"
+      tags: always
+
+    - name: Test Controller API connectivity
+      ansible.builtin.uri:
+        url: "{{ controller_host }}/api/controller/v2/ping/"
+        method: GET
+        return_content: true
+        status_code: 200
+        validate_certs: "{{ controller_verify_ssl }}"
+        headers: "{{ {'Authorization': 'Bearer ' ~ _controller_token} if (_controller_token | length > 0) else omit }}"
+        url_username: "{{ _controller_username if (_controller_token | length == 0) else omit }}"
+        url_password: "{{ _controller_password if (_controller_token | length == 0) else omit }}"
+        force_basic_auth: "{{ true if (_controller_token | length == 0) else omit }}"
+      register: _api_ping
+      retries: "{{ api_retry_count }}"
+      delay: "{{ api_retry_delay }}"
+      until: _api_ping.status == 200
+      failed_when: false
+      tags: always
+
+    - name: Handle API connectivity issues
+      block:
+        - name: Display connectivity troubleshooting
+          ansible.builtin.debug:
+            msg: |
+              Failed to connect to AAP Controller API
+              
+              URL: {{ controller_host }}/api/controller/v2/ping/
+              Status: {{ _api_ping.status | default('No response') }}
+              Error: {{ _api_ping.msg | default('Connection failed') }}
+              
+              Troubleshooting:
+              1. Verify controller_host URL is correct
+              2. Check network connectivity: curl -k {{ controller_host }}/api/controller/v2/ping/
+              3. If using self-signed certs, set controller_verify_ssl: false
+              4. Verify AAP services are running
+              5. Check firewall rules allow HTTPS (443)
+
+        - name: Fail with helpful message
+          ansible.builtin.fail:
+            msg: "Cannot proceed without AAP API connectivity. See troubleshooting above."
+      when: _api_ping is failed
+      tags: always
+
+    - name: Display API connectivity success
+      ansible.builtin.debug:
+        msg: "Successfully connected to AAP Controller: {{ controller_host }}"
+      when: _api_ping is succeeded
+      tags: always
+
+    - name: Validate required configuration
+      ansible.builtin.assert:
+        that:
+          - controller_host | length > 0
+          - organization_name | length > 0
+          - project_name | length > 0
+          - inventory_name | length > 0
+        fail_msg: |
+          Missing required configuration variables.
+          Required: controller_host, organization_name, project_name, inventory_name
+          
+          Provide via:
+          - Extra vars: -e controller_host=https://aap.example.com
+          - controller_vars.yml file
+        success_msg: "Required configuration validated"
+      tags: always
+
+  tasks:
+    - name: Ensure ansible.controller collection is available
+      block:
+        - name: Check for ansible.controller collection
+          ansible.builtin.command:
+            cmd: ansible-galaxy collection list ansible.controller
+          register: _collection_check
+          changed_when: false
+          failed_when: false
+
+        - name: Install ansible.controller collection if missing
+          ansible.builtin.command:
+            cmd: ansible-galaxy collection install ansible.controller
+          when: _collection_check.rc != 0
+          changed_when: true
+          become: false
+      rescue:
+        - name: Warn about collection installation
+          ansible.builtin.debug:
+            msg: |
+              WARNING: ansible.controller collection not found and auto-install failed.
+              Install manually: ansible-galaxy collection install ansible.controller
+              Continuing, but job template tasks may fail.
+      tags: setup
+
+    - name: Create job templates
+      ansible.controller.job_template:
+        controller_host: "{{ controller_host }}"
+        controller_oauthtoken: "{{ _controller_token if _controller_token | length > 0 else omit }}"
+        controller_username: "{{ _controller_username if (_controller_token | length == 0 and _controller_username | length > 0) else omit }}"
+        controller_password: "{{ _controller_password if (_controller_token | length == 0 and _controller_password | length > 0) else omit }}"
+        validate_certs: "{{ controller_verify_ssl }}"
+        name: "{{ item.name }}"
+        description: "{{ item.description }}"
+        organization: "{{ organization_name }}"
+        project: "{{ project_name }}"
+        inventory: "{{ inventory_name }}"
+        playbook: "{{ item.playbook }}"
+        job_type: run
+        credentials: "{{ [credential_name] if credential_name | length > 0 else omit }}"
+        execution_environment: "{{ execution_environment if execution_environment | length > 0 else omit }}"
+        survey_enabled: "{{ item.survey_enabled | default(false) }}"
+        survey_spec: "{{ item.survey_spec | default(omit) }}"
+        ask_variables_on_launch: true
+        ask_limit_on_launch: true
+        state: present
+      loop: "{{ job_templates }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: _job_template_results
+      failed_when: false
+      tags: job_templates
+
+    - name: Display job template creation results
+      ansible.builtin.debug:
+        msg: |
+          Job Template: {{ item.item.name }}
+          Status: {{ 'Created/Updated' if not item.failed else 'FAILED' }}
+          {% if item.failed %}
+          Error: {{ item.msg | default('Unknown error') }}
+          {% endif %}
+      loop: "{{ _job_template_results.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+      tags: job_templates
+
+    - name: Count successful and failed templates
+      ansible.builtin.set_fact:
+        _successful_count: "{{ _job_template_results.results | rejectattr('failed') | list | length }}"
+        _failed_count: "{{ _job_template_results.results | selectattr('failed') | list | length }}"
+      tags: job_templates
+
+    - name: Final summary
+      ansible.builtin.debug:
+        msg: |
+          ========================================
+          AAP Job Template Configuration Complete
+          ========================================
+          
+          Controller: {{ controller_host }}
+          Organization: {{ organization_name }}
+          Project: {{ project_name }}
+          Inventory: {{ inventory_name }}
+          
+          Results:
+          - Successful: {{ _successful_count }}/{{ job_templates | length }}
+          - Failed: {{ _failed_count }}/{{ job_templates | length }}
+          
+          Created/Updated Templates:
+          {% for result in _job_template_results.results %}
+          {% if not result.failed %}
+          [SUCCESS] {{ result.item.name }}
+          {% endif %}
+          {% endfor %}
+          
+          {% if _failed_count | int > 0 %}
+          Failed Templates:
+          {% for result in _job_template_results.results %}
+          {% if result.failed %}
+          [FAILED] {{ result.item.name }}: {{ result.msg | default('Unknown error') }}
+          {% endif %}
+          {% endfor %}
+          {% endif %}
+          
+          Next Steps:
+          1. Log into AAP UI: {{ controller_host }}
+          2. Navigate to Resources > Templates
+          3. Test job templates with sample data
+          4. Configure notifications and schedules
+          
+          Documentation:
+          - See playbooks/README.md for detailed usage
+          - AAP API docs: {{ controller_host }}/api/controller/v2/
+      tags: always

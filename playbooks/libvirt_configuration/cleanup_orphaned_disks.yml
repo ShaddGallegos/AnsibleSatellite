@@ -1,0 +1,62 @@
+---
+# Cleanup Orphaned VM Disk Volumes
+# Synopsis: Identifies and optionally deletes orphaned libvirt disk volumes in the images pool that no longer correspond to existing VM domains.
+- name: Cleanup orphaned VM disk volumes
+  hosts: localhost
+  gather_facts: false
+  vars:
+    kvm_host: "10.168.0.1"
+    domain_pattern: "prod.spg"
+  
+  tasks:
+    - name: Get list of all VM domains on KVM host
+      shell: |
+        ssh root@{{ kvm_host }} "virsh list --all --name"
+      register: vm_list
+      changed_when: false
+
+    - name: Get list of all disk volumes in images pool
+      shell: |
+        ssh root@{{ kvm_host }} "virsh vol-list images 2>/dev/null | awk 'NR>2 {print \$1}' | grep -v '^$'"
+      register: disk_list
+      changed_when: false
+      failed_when: false
+
+    - name: Display current VMs
+      debug:
+        msg: "Active VMs: {{ vm_list.stdout_lines }}"
+
+    - name: Display disk volumes
+      debug:
+        msg: "Disk volumes: {{ disk_list.stdout_lines | default([]) }}"
+
+    - name: Find orphaned disks (disks without matching VMs)
+      set_fact:
+        orphaned_disks: "{{ disk_list.stdout_lines | default([]) | select('match', '.*' + domain_pattern + '.*') | list }}"
+      when: disk_list.stdout_lines is defined
+
+    - name: Filter out disks that have matching VMs
+      set_fact:
+        truly_orphaned: "{{ orphaned_disks | reject('regex', vm_list.stdout) | list }}"
+      when: orphaned_disks is defined
+
+    - name: Show orphaned disks
+      debug:
+        msg: "Orphaned disks to remove: {{ truly_orphaned | default([]) }}"
+
+    - name: Confirm deletion
+      pause:
+        prompt: "About to delete {{ (truly_orphaned | default([]) | length) }} orphaned disk(s). Press ENTER to continue or Ctrl+C to abort"
+      when: (truly_orphaned | default([]) | length) > 0
+
+    - name: Delete orphaned disk volumes
+      shell: |
+        ssh root@{{ kvm_host }} "virsh vol-delete {{ item }} --pool images"
+      loop: "{{ truly_orphaned | default([]) }}"
+      when: (truly_orphaned | default([]) | length) > 0
+      register: delete_results
+
+    - name: Show deletion results
+      debug:
+        msg: "Deleted {{ delete_results.results | length }} orphaned disk volume(s)"
+      when: delete_results.results is defined

@@ -1,0 +1,171 @@
+<%# RHEL 9.7 x86_64 Post-Kickstart Default Provisioning Template %>
+<%# Derived from satellite_node_post_install.yml Ansible playbook features %>
+<%# Variables you can set via Foreman parameters or template inputs: %>
+<%#   admin_user (default: admin) %>
+<%#   admin_password (hashed later, default: r3dh4t7!) %>
+<%#   force_password_change (boolean default: true) %>
+<%#   activation_keys (hash mapping major version to key) %>
+<%#   ks_enable_updates (boolean default: false) %>
+<%#   ks_firewall_services (comma separated list default: ssh,http,https) %>
+<%# SECURITY NOTE: Never expose private keys; only derive public key from /usr/share/foreman/.ssh/id_rsa %>
+
+<%# Ruby helpers for defaults %>
+<% admin_user              = @host.params['admin_user']              || 'admin' %>
+<% admin_password_plain    = @host.params['admin_password']          || 'r3dh4t7!' %>
+<% force_password_change   = (@host.params['force_password_change']  || 'true').to_s.downcase == 'true' %>
+<% ks_enable_updates       = (@host.params['ks_enable_updates']      || 'false').to_s.downcase == 'true' %>
+<% firewall_services_param = @host.params['ks_firewall_services']    || 'ssh,http,https' %>
+<% firewall_services       = firewall_services_param.split(',') %>
+<% activation_keys_hash    = @host.params['activation_keys'] || '' %>
+<%# activation_keys expected format: "7:RHEL7-AK,8:RHEL8-AK,9:RHEL9-AK" %>
+<% ak_map = {}; activation_keys_hash.split(',').each { |p| k,v=p.split(':'); ak_map[k]=v if k && v } %>
+<% os_major = @host.operatingsystem.major.to_s %>
+<% activation_key = ak_map[os_major] || '' %>
+
+%post --log=/root/ks-post.log
+set -euo pipefail
+
+log() { echo "[POST] $(date +%F_%T) $*" | tee -a /root/post-install-summary.txt; }
+warn() { echo "[POST][WARN] $(date +%F_%T) $*" | tee -a /root/post-install-summary.txt; }
+err()  { echo "[POST][ERROR] $(date +%F_%T) $*" | tee -a /root/post-install-summary.txt; }
+
+log "Starting post-install configuration for <%= @host.name %> (OS major: <%= os_major %>)"
+
+# Ensure networking and basic tools
+sleep 5
+ping -c1 <%= @host.ip %> >/dev/null 2>&1 || warn "Ping to self IP failed (non-fatal)"
+
+# Admin user management
+if id <%= admin_user %> >/dev/null 2>&1; then
+  log "Admin user <%= admin_user %> already exists; updating password"
+else
+  log "Creating admin user <%= admin_user %>"
+  useradd -m -s /bin/bash <%= admin_user %> || err "Failed to create admin user"
+fi
+# Set password (hashed)
+if command -v openssl >/dev/null 2>&1; then
+  HASH=$(openssl passwd -6 "<%= admin_password_plain %>")
+else
+  HASH=$(python3 -c 'import crypt,sys;print(crypt.crypt(sys.argv[1], crypt.mksalt(crypt.METHOD_SHA512)))' "<%= admin_password_plain %>")
+fi
+usermod -p "$HASH" <%= admin_user %> || warn "Password update may have failed"
+
+# Force password change
+if <%= force_password_change ? 'true' : 'false' %>; then
+  chage -d 0 <%= admin_user %> || warn "Could not force password change"
+fi
+
+# Sudoers entry
+if ! grep -q '^<%= admin_user %> ' /etc/sudoers; then
+  echo "<%= admin_user %> ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers || warn "Failed to append sudoers"
+fi
+
+# SSH configuration tweaks
+if grep -q '^Host \*' /etc/ssh/ssh_config; then
+  if grep -q '^\s*StrictHostKeyChecking' /etc/ssh/ssh_config; then
+    sed -i 's/^\s*StrictHostKeyChecking.*/    StrictHostKeyChecking no/' /etc/ssh/ssh_config
+  else
+    sed -i '/^Host \*/a \\    StrictHostKeyChecking no' /etc/ssh/ssh_config
+  fi
+fi
+if grep -q '^PermitRootLogin' /etc/ssh/sshd_config; then
+  sed -i 's/^PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+else
+  echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config
+fi
+systemctl restart sshd || warn "Failed to restart sshd"
+
+# Generate admin SSH key if missing
+ADMIN_HOME=$(getent passwd <%= admin_user %> | cut -d: -f6)
+if [ -n "$ADMIN_HOME" ]; then
+  mkdir -p "$ADMIN_HOME/.ssh" && chmod 700 "$ADMIN_HOME/.ssh"
+  if [ ! -f "$ADMIN_HOME/.ssh/id_rsa" ]; then
+    sudo -u <%= admin_user %> ssh-keygen -t rsa -b 4096 -N '' -f "$ADMIN_HOME/.ssh/id_rsa" -C "<%= admin_user %>@<%= @host.name %>" || warn "SSH key generation failed"
+  fi
+else
+  warn "Could not determine admin home directory"
+fi
+
+# Inject Foreman public key (derive from private if only private exists)
+if [ -f /usr/share/foreman/.ssh/id_rsa ]; then
+  if [ ! -f /usr/share/foreman/.ssh/id_rsa.pub ]; then
+    ssh-keygen -y -f /usr/share/foreman/.ssh/id_rsa > /usr/share/foreman/.ssh/id_rsa.pub || warn "Could not derive public key"
+  fi
+  if [ -f /usr/share/foreman/.ssh/id_rsa.pub ]; then
+    FOREMAN_PUB=$(cat /usr/share/foreman/.ssh/id_rsa.pub)
+    if [ -n "$ADMIN_HOME" ]; then
+      grep -qxF "$FOREMAN_PUB" "$ADMIN_HOME/.ssh/authorized_keys" 2>/dev/null || echo "$FOREMAN_PUB" >> "$ADMIN_HOME/.ssh/authorized_keys"
+      chmod 600 "$ADMIN_HOME/.ssh/authorized_keys"
+    fi
+    mkdir -p /root/.ssh && chmod 700 /root/.ssh
+    grep -qxF "$FOREMAN_PUB" /root/.ssh/authorized_keys 2>/dev/null || echo "$FOREMAN_PUB" >> /root/.ssh/authorized_keys
+    chmod 600 /root/.ssh/authorized_keys
+    log "Foreman public key injected"
+  fi
+else
+  warn "Foreman private key not found at /usr/share/foreman/.ssh/id_rsa"
+fi
+
+# Hostname ensure short name present in /etc/hosts
+SHORTNAME=$(echo <%= @host.name %> | cut -d. -f1)
+if [ "$SHORTNAME" != "<%= @host.shortname %>" ]; then
+  SHORTNAME="<%= @host.shortname %>"
+fi
+if ! grep -q "$(hostname -I | awk '{print $1}')" /etc/hosts; then
+  echo "$(hostname -I | awk '{print $1}') <%= @host.name %> $SHORTNAME" >> /etc/hosts
+fi
+
+# Satellite registration
+if command -v subscription-manager >/dev/null 2>&1; then
+  if ! subscription-manager identity >/dev/null 2>&1; then
+    log "Attempting Satellite registration"
+    if [ -n "<%= activation_key %>" ]; then
+      rpm -Uvh --nodigest --nofiledigest --replacepkgs http://<%= @host.params['satellite_ip'] || '10.168.151.127' %>/pub/katello-ca-consumer-<%= @host.params['satellite_fqdn'] || 'satellite.prod.spg' %>-1.0-1.noarch.rpm || warn "CA RPM install failed"
+      subscription-manager register --org=Default_Organization --activationkey=<%= activation_key %> || warn "Registration failed"
+    else
+      warn "No activation key mapped for OS major <%= os_major %>"
+    fi
+  else
+    log "Already registered to Satellite"
+  fi
+else
+  warn "subscription-manager not available"
+fi
+
+# Enable repos & install katello-agent
+if subscription-manager identity >/dev/null 2>&1; then
+  REPO="satellite-client-6-for-rhel-<%= os_major %>-x86_64-rpms"
+  subscription-manager repos --enable "$REPO" || warn "Failed to enable $REPO"
+  yum -y install katello-agent || warn "katello-agent install failed"
+fi
+
+# Firewall configuration
+if systemctl status firewalld >/dev/null 2>&1; then
+  systemctl enable --now firewalld || warn "Could not ensure firewalld running"
+  for svc in <%= firewall_services.join(' ') %>; do
+    firewall-cmd --permanent --add-service="$svc" || warn "Failed to add service $svc"
+  done
+  firewall-cmd --reload || warn "Firewall reload failed"
+  log "Firewall services enabled: <%= firewall_services.join(', ') %>"
+else
+  warn "firewalld not present"
+fi
+
+# Optional system updates
+if <%= ks_enable_updates ? 'true' : 'false' %>; then
+  log "Starting full system update"
+  yum -y update || warn "Some updates may have failed"
+else
+  log "System updates skipped (ks_enable_updates=false)"
+fi
+
+# Summary
+log "Post-install configuration complete for <%= @host.name %>"
+log "Admin user: <%= admin_user %>"
+log "Activation key used: <%= activation_key.empty? ? 'None/Unavailable' : activation_key %>"
+log "Satellite registration status: $(subscription-manager identity >/dev/null 2>&1 && echo Registered || echo NotRegistered)"
+log "Firewall status: $(systemctl is-active firewalld 2>/dev/null || echo inactive)"
+
+%end
+
+<%# End of template %>

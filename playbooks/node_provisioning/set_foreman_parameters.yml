@@ -1,0 +1,106 @@
+---
+# Create or update Foreman global parameters needed by the %post logic
+# Synopsis: Idempotently upserts Satellite global parameters (admin_user, admin_password, activation_keys, ks_enable_updates) required by post-kickstart provisioning template.
+# Parameters:
+#   - admin_user: login name for admin account created on provisioned nodes
+#   - admin_password: password for that account (ensure secure handling)
+#   - activation_keys: mapping of OS major -> activation key string (e.g., "8:RHEL8-AK,9:RHEL9-AK")
+#   - ks_enable_updates: true/false to run dnf update during %post
+#
+# Usage:
+#   SATELLITE_PASSWORD='...' ansible-playbook set_foreman_parameters.yml \
+#     -e satellite_username=admin \
+#     -e admin_user=admin -e admin_password='Secret123!' \
+#     -e activation_keys='9:RHEL9-AK' -e ks_enable_updates=true
+
+- name: Ensure required Foreman global parameters exist
+  hosts: localhost
+  gather_facts: false
+  connection: local
+
+  vars:
+    satellite_url: "https://satellite.prod.spg"
+    satellite_username: "{{ satellite_username | default('admin') }}"
+    satellite_password: "{{ satellite_password | default(lookup('env','SATELLITE_PASSWORD')) }}"
+    validate_certs: false
+
+    # Values to set (can be overridden via -e)
+    admin_user: "{{ admin_user | default('admin') }}"
+    admin_password: "{{ admin_password | default('ChangeMe!') }}"
+    activation_keys: "{{ activation_keys | default('9:RHEL9-AK') }}"
+    ks_enable_updates: "{{ ks_enable_updates | default(true) }}"
+
+  tasks:
+    - name: Fail fast if password not provided
+      ansible.builtin.fail:
+        msg: "satellite_password not supplied (set SATELLITE_PASSWORD env var or -e satellite_password=...)"
+      when: satellite_password | default('') | length == 0
+
+    - name: Helper to upsert a global parameter
+      vars:
+        param_name: "{{ item.name }}"
+        param_value: "{{ item.value }}"
+        param_hidden: "{{ item.hidden | default(false) }}"
+      block:
+        - name: Search parameter by name
+          ansible.builtin.uri:
+            url: "{{ satellite_url }}/api/v2/parameters?search=name=\"{{ param_name | urlencode }}\""
+            method: GET
+            user: "{{ satellite_username }}"
+            password: "{{ satellite_password }}"
+            force_basic_auth: true
+            validate_certs: "{{ validate_certs }}"
+            status_code: 200
+          register: _param_search
+          no_log: true
+
+        - name: Extract parameter id (if any)
+          ansible.builtin.set_fact:
+            _param_id: "{{ (_param_search.json.results | selectattr('name','equalto', param_name) | map(attribute='id') | list | first) | default(None) }}"
+
+        - name: Create parameter if missing
+          ansible.builtin.uri:
+            url: "{{ satellite_url }}/api/v2/parameters"
+            method: POST
+            user: "{{ satellite_username }}"
+            password: "{{ satellite_password }}"
+            force_basic_auth: true
+            validate_certs: "{{ validate_certs }}"
+            status_code: [201]
+            body_format: json
+            body:
+              parameter:
+                name: "{{ param_name }}"
+                value: "{{ param_value }}"
+                hidden_value: "{{ param_hidden }}"
+          register: _param_created
+          when: _param_id is none
+          no_log: true
+
+        - name: Update parameter if exists (change value or hidden flag)
+          ansible.builtin.uri:
+            url: "{{ satellite_url }}/api/v2/parameters/{{ _param_id }}"
+            method: PUT
+            user: "{{ satellite_username }}"
+            password: "{{ satellite_password }}"
+            force_basic_auth: true
+            validate_certs: "{{ validate_certs }}"
+            status_code: [200]
+            body_format: json
+            body:
+              parameter:
+                value: "{{ param_value }}"
+                hidden_value: "{{ param_hidden }}"
+          register: _param_updated
+          when: _param_id is not none
+          no_log: true
+
+      loop:
+        - { name: "admin_user", value: "{{ admin_user }}", hidden: false }
+        - { name: "admin_password", value: "{{ admin_password }}", hidden: true }
+        - { name: "activation_keys", value: "{{ activation_keys }}", hidden: false }
+        - { name: "ks_enable_updates", value: "{{ ks_enable_updates | string }}", hidden: false }
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg: "Global parameters ensured: admin_user, admin_password, activation_keys, ks_enable_updates"

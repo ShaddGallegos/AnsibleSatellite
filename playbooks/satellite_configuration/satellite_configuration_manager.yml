@@ -1,0 +1,651 @@
+---
+# Satellite Configuration Manager
+# Synopsis: Centralized management of Satellite compute profiles, default discovery, and PXE template kernel parameter corrections with robust validation and retries.
+# Unified playbook for Satellite configuration operations
+# Compatible with Ansible Automation Platform 2.6
+#
+# OPERATIONS:
+#   - compute_profiles: Configure compute profiles for PXE boot
+#   - discover_defaults: Discover and set Satellite default values
+#   - fix_pxe_templates: Fix PXE templates with inst.stage2 parameter
+#
+# USAGE:
+#   ansible-playbook satellite_configuration_manager.yml \
+#     -e operation=compute_profiles \
+#     -e satellite_password=password
+
+- name: Satellite Configuration Management
+  hosts: satellite
+  gather_facts: true
+  become: true
+  
+  vars:
+    # Operation to perform
+    operation: "{{ operation | default('') }}"
+    
+    # Authentication
+    satellite_user: "{{ satellite_user | default('admin') }}"
+    satellite_password: "{{ satellite_password | default(lookup('env', 'SATELLITE_PASSWORD')) }}"
+    satellite_url: "https://{{ inventory_hostname }}"
+    
+    # Compute Profile Configuration
+    compute_resource_id: "{{ compute_resource_id | default(1) }}"
+    pxe_bridge: "{{ pxe_bridge | default('virbr1') }}"
+    pxe_network: "{{ pxe_network | default('internal') }}"
+    subnet_id: "{{ subnet_id | default(1) }}"
+    
+    # PXE Template Configuration
+    template_dir: "/usr/share/foreman/app/views/unattended/provisioning_templates"
+    kickstart_snippet: "{{ template_dir }}/snippet/kickstart_kernel_options.erb"
+    
+    # API Settings
+    api_retry_count: "{{ api_retry_count | default(3) }}"
+    api_retry_delay: "{{ api_retry_delay | default(5) }}"
+    api_timeout: "{{ api_timeout | default(30) }}"
+
+  pre_tasks:
+    - name: Validate operation parameter
+      ansible.builtin.assert:
+        that:
+          - operation is defined
+          - operation in ['compute_profiles', 'discover_defaults', 'fix_pxe_templates']
+        fail_msg: |
+          Invalid operation. Must be one of:
+          - compute_profiles
+          - discover_defaults
+          - fix_pxe_templates
+        success_msg: "Operation validated: {{ operation }}"
+      tags: always
+
+    - name: Validate credentials
+      ansible.builtin.assert:
+        that:
+          - satellite_password | length > 0
+        fail_msg: "Satellite password required. Set via -e satellite_password=PASSWORD or export SATELLITE_PASSWORD=password"
+        success_msg: "Credentials present"
+      no_log: true
+      tags: always
+      when: operation != 'fix_pxe_templates'
+
+    - name: Check hammer CLI availability
+      ansible.builtin.command:
+        cmd: which hammer
+      register: _hammer_check
+      changed_when: false
+      failed_when: false
+      tags: always
+      when: operation == 'discover_defaults'
+
+    - name: Verify hammer CLI for discovery operation
+      ansible.builtin.assert:
+        that:
+          - _hammer_check.rc == 0
+        fail_msg: |
+          hammer CLI not found. Install with:
+          yum install rubygem-hammer_cli rubygem-hammer_cli_foreman
+        success_msg: "hammer CLI available"
+      when:
+        - operation == 'discover_defaults'
+        - _hammer_check is defined
+      tags: always
+
+  tasks:
+    # ========================================
+    # COMPUTE PROFILES CONFIGURATION
+    # ========================================
+    
+    - name: Compute Profiles - Get current profiles
+      ansible.builtin.uri:
+        url: "{{ satellite_url }}/api/compute_profiles"
+        method: GET
+        user: "{{ satellite_user }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        return_content: true
+        status_code: 200
+        timeout: "{{ api_timeout }}"
+      register: _compute_profiles
+      retries: "{{ api_retry_count }}"
+      delay: "{{ api_retry_delay }}"
+      until: _compute_profiles.status == 200
+      no_log: true
+      when: operation == 'compute_profiles'
+      tags:
+        - compute_profiles
+
+    - name: Compute Profiles - Display discovered profiles
+      ansible.builtin.debug:
+        msg: |
+          Found {{ _compute_profiles.json.total | default(0) }} compute profiles:
+          {% for profile in _compute_profiles.json.results | default([]) %}
+          - ID: {{ profile.id }} | Name: {{ profile.name }}
+          {% endfor %}
+      when:
+        - operation == 'compute_profiles'
+        - _compute_profiles is defined
+      tags:
+        - compute_profiles
+
+    - name: Compute Profiles - Get current compute attributes
+      ansible.builtin.uri:
+        url: "{{ satellite_url }}/api/compute_resources/{{ compute_resource_id }}/compute_profiles/{{ item.id }}"
+        method: GET
+        user: "{{ satellite_user }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        return_content: true
+        status_code: 200
+        timeout: "{{ api_timeout }}"
+      register: _current_attributes
+      retries: "{{ api_retry_count }}"
+      delay: "{{ api_retry_delay }}"
+      until: _current_attributes.status == 200
+      loop: "{{ _compute_profiles.json.results | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+      no_log: true
+      when:
+        - operation == 'compute_profiles'
+        - _compute_profiles is defined
+      tags:
+        - compute_profiles
+
+    - name: Compute Profiles - Extract current bridge settings
+      ansible.builtin.set_fact:
+        _profile_bridges: >-
+          {{
+            _profile_bridges | default({}) | combine({
+              item.item.name: {
+                'id': item.item.id,
+                'current_bridge': item.json.compute_attributes[0].vm_attrs.nics_attributes['0'].bridge | default('NOT_SET')
+              }
+            })
+          }}
+      loop: "{{ _current_attributes.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+      when:
+        - operation == 'compute_profiles'
+        - _current_attributes is defined
+        - item.json is defined
+        - item.json.compute_attributes is defined
+        - item.json.compute_attributes | length > 0
+      tags:
+        - compute_profiles
+
+    - name: Compute Profiles - Display current bridge configuration
+      ansible.builtin.debug:
+        msg: |
+          Profile: {{ item.key }}
+          Current Bridge: {{ item.value.current_bridge }}
+          Target Bridge: {{ pxe_bridge }}
+          Status: {{ 'OK' if item.value.current_bridge == pxe_bridge else 'NEEDS UPDATE' }}
+      loop: "{{ _profile_bridges | default({}) | dict2items }}"
+      when:
+        - operation == 'compute_profiles'
+        - _profile_bridges is defined
+      tags:
+        - compute_profiles
+
+    - name: Compute Profiles - Update network configuration
+      ansible.builtin.uri:
+        url: "{{ satellite_url }}/api/compute_profiles/{{ item.value.id }}"
+        method: PUT
+        user: "{{ satellite_user }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: json
+        body:
+          compute_profile:
+            compute_attributes:
+              "{{ compute_resource_id }}":
+                nics_attributes:
+                  "0":
+                    type: bridge
+                    bridge: "{{ pxe_bridge }}"
+                    network: "{{ pxe_network }}"
+                    model: virtio
+        status_code: 200
+        timeout: "{{ api_timeout }}"
+      register: _profile_update
+      retries: "{{ api_retry_count }}"
+      delay: "{{ api_retry_delay }}"
+      until: _profile_update.status == 200
+      loop: "{{ _profile_bridges | default({}) | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      when:
+        - operation == 'compute_profiles'
+        - _profile_bridges is defined
+        - item.value.current_bridge != pxe_bridge
+      no_log: true
+      tags:
+        - compute_profiles
+
+    - name: Compute Profiles - Configuration summary
+      ansible.builtin.debug:
+        msg: |
+          ==========================================
+          COMPUTE PROFILE CONFIGURATION COMPLETE
+          ==========================================
+          
+          Network Configuration:
+          - Bridge: {{ pxe_bridge }}
+          - Network: {{ pxe_network }}
+          - Subnet ID: {{ subnet_id }}
+          - Model: virtio
+          
+          Profiles Updated: {{ _profile_update.results | default([]) | selectattr('changed', 'equalto', true) | list | length }}
+          Profiles Already Configured: {{ _profile_bridges | default({}) | length - (_profile_update.results | default([]) | selectattr('changed', 'equalto', true) | list | length) }}
+          
+          Network Details:
+          - Satellite: {{ inventory_hostname }} (DHCP/TFTP/HTTP)
+          - KVM Gateway: 10.168.0.1 (virbr1)
+          - VM Network: virbr1 bridge for PXE boot
+          
+          Troubleshooting:
+          1. Verify VM network: virsh dumpxml VM_NAME | grep bridge
+          2. Test connectivity: ping 10.168.151.127 from VM
+          3. Check TFTP: systemctl status tftp.socket
+          ==========================================
+      when: operation == 'compute_profiles'
+      tags:
+        - compute_profiles
+
+    # ========================================
+    # DISCOVER SATELLITE DEFAULTS
+    # ========================================
+    
+    - name: Discover Defaults - Get organizations
+      ansible.builtin.command:
+        cmd: hammer --output json organization list
+      register: _org_list
+      changed_when: false
+      failed_when: false
+      when: operation == 'discover_defaults'
+      tags:
+        - discover_defaults
+
+    - name: Discover Defaults - Get locations
+      ansible.builtin.command:
+        cmd: hammer --output json location list
+      register: _loc_list
+      changed_when: false
+      failed_when: false
+      when: operation == 'discover_defaults'
+      tags:
+        - discover_defaults
+
+    - name: Discover Defaults - Get hostgroups
+      ansible.builtin.command:
+        cmd: hammer --output json hostgroup list
+      register: _hg_list
+      changed_when: false
+      failed_when: false
+      when: operation == 'discover_defaults'
+      tags:
+        - discover_defaults
+
+    - name: Discover Defaults - Get compute resources
+      ansible.builtin.command:
+        cmd: hammer --output json compute-resource list
+      register: _cr_list
+      changed_when: false
+      failed_when: false
+      when: operation == 'discover_defaults'
+      tags:
+        - discover_defaults
+
+    - name: Discover Defaults - Get compute profiles
+      ansible.builtin.command:
+        cmd: hammer --output json compute-profile list
+      register: _cp_list
+      changed_when: false
+      failed_when: false
+      when: operation == 'discover_defaults'
+      tags:
+        - discover_defaults
+
+    - name: Discover Defaults - Get domains
+      ansible.builtin.command:
+        cmd: hammer --output json domain list
+      register: _dom_list
+      changed_when: false
+      failed_when: false
+      when: operation == 'discover_defaults'
+      tags:
+        - discover_defaults
+
+    - name: Discover Defaults - Get subnets
+      ansible.builtin.command:
+        cmd: hammer --output json subnet list
+      register: _subnet_list
+      changed_when: false
+      failed_when: false
+      when: operation == 'discover_defaults'
+      tags:
+        - discover_defaults
+
+    - name: Discover Defaults - Get architectures
+      ansible.builtin.command:
+        cmd: hammer --output json architecture list
+      register: _arch_list
+      changed_when: false
+      failed_when: false
+      when: operation == 'discover_defaults'
+      tags:
+        - discover_defaults
+
+    - name: Discover Defaults - Get operating systems
+      ansible.builtin.command:
+        cmd: hammer --output json os list
+      register: _os_list
+      changed_when: false
+      failed_when: false
+      when: operation == 'discover_defaults'
+      tags:
+        - discover_defaults
+
+    - name: Discover Defaults - Get media
+      ansible.builtin.command:
+        cmd: hammer --output json medium list
+      register: _medium_list
+      changed_when: false
+      failed_when: false
+      when: operation == 'discover_defaults'
+      tags:
+        - discover_defaults
+
+    - name: Discover Defaults - Display discovered values
+      ansible.builtin.debug:
+        msg: |
+          ==========================================
+          DISCOVERED SATELLITE DEFAULTS
+          ==========================================
+          
+          Organizations ({{ (_org_list.stdout | from_json) | length }}):
+          {% for org in (_org_list.stdout | from_json) | default([]) %}
+          - {{ org.Name }} (ID: {{ org.Id }})
+          {% endfor %}
+          
+          Locations ({{ (_loc_list.stdout | from_json) | length }}):
+          {% for loc in (_loc_list.stdout | from_json) | default([]) %}
+          - {{ loc.Name }} (ID: {{ loc.Id }})
+          {% endfor %}
+          
+          Hostgroups ({{ (_hg_list.stdout | from_json) | length }}):
+          {% for hg in (_hg_list.stdout | from_json) | default([]) %}
+          - {{ hg.Title }} (ID: {{ hg.Id }})
+          {% endfor %}
+          
+          Compute Resources ({{ (_cr_list.stdout | from_json) | length }}):
+          {% for cr in (_cr_list.stdout | from_json) | default([]) %}
+          - {{ cr.Name }} (ID: {{ cr.Id }}, Type: {{ cr.Provider }})
+          {% endfor %}
+          
+          Compute Profiles ({{ (_cp_list.stdout | from_json) | length }}):
+          {% for cp in (_cp_list.stdout | from_json) | default([]) %}
+          - {{ cp.Name }} (ID: {{ cp.Id }})
+          {% endfor %}
+          
+          Domains ({{ (_dom_list.stdout | from_json) | length }}):
+          {% for dom in (_dom_list.stdout | from_json) | default([]) %}
+          - {{ dom.Name }} (ID: {{ dom.Id }})
+          {% endfor %}
+          
+          Subnets ({{ (_subnet_list.stdout | from_json) | length }}):
+          {% for sub in (_subnet_list.stdout | from_json) | default([]) %}
+          - {{ sub.Name }} (ID: {{ sub.Id }}, Network: {{ sub.Network }})
+          {% endfor %}
+          
+          Architectures ({{ (_arch_list.stdout | from_json) | length }}):
+          {% for arch in (_arch_list.stdout | from_json) | default([]) %}
+          - {{ arch.Name }} (ID: {{ arch.Id }})
+          {% endfor %}
+          
+          Operating Systems ({{ (_os_list.stdout | from_json) | length }}):
+          {% for os in (_os_list.stdout | from_json) | default([]) %}
+          - {{ os.Title }} (ID: {{ os.Id }})
+          {% endfor %}
+          
+          Installation Media ({{ (_medium_list.stdout | from_json) | length }}):
+          {% for med in (_medium_list.stdout | from_json) | default([]) %}
+          - {{ med.Name }} (ID: {{ med.Id }})
+          {% endfor %}
+          
+          ==========================================
+          USAGE IN PLAYBOOKS
+          ==========================================
+          
+          Use discovered values in other playbooks:
+          
+          organization: "{{ (_org_list.stdout | from_json)[0].Name | default('Default Organization') }}"
+          location: "{{ (_loc_list.stdout | from_json)[0].Name | default('Default Location') }}"
+          hostgroup: "{{ (_hg_list.stdout | from_json)[0].Title | default('Compute') }}"
+          compute_resource: "{{ (_cr_list.stdout | from_json)[0].Name | default('kaso.prod.spg') }}"
+          compute_profile: "{{ (_cp_list.stdout | from_json)[0].Name | default('1-Small') }}"
+          domain: "{{ (_dom_list.stdout | from_json)[0].Name | default('prod.spg') }}"
+          subnet: "{{ (_subnet_list.stdout | from_json)[0].Name | default('Internal') }}"
+          architecture: "{{ (_arch_list.stdout | from_json)[0].Name | default('x86_64') }}"
+          ==========================================
+      when: operation == 'discover_defaults'
+      tags:
+        - discover_defaults
+
+    - name: Discover Defaults - Save to file
+      ansible.builtin.copy:
+        content: |
+          # Discovered Satellite Defaults
+          # Generated: {{ ansible_date_time.iso8601 }}
+          
+          organization: "{{ (_org_list.stdout | from_json)[0].Name | default('Default Organization') }}"
+          location: "{{ (_loc_list.stdout | from_json)[0].Name | default('Default Location') }}"
+          hostgroup: "{{ (_hg_list.stdout | from_json)[0].Title | default('Compute') }}"
+          compute_resource: "{{ (_cr_list.stdout | from_json)[0].Name | default('kaso.prod.spg') }}"
+          compute_profile: "{{ (_cp_list.stdout | from_json)[0].Name | default('1-Small') }}"
+          domain: "{{ (_dom_list.stdout | from_json)[0].Name | default('prod.spg') }}"
+          subnet: "{{ (_subnet_list.stdout | from_json)[0].Name | default('Internal') }}"
+          architecture: "{{ (_arch_list.stdout | from_json)[0].Name | default('x86_64') }}"
+        dest: "/tmp/satellite_discovered_defaults.yml"
+        mode: '0644'
+      when: operation == 'discover_defaults'
+      tags:
+        - discover_defaults
+
+    - name: Discover Defaults - File location
+      ansible.builtin.debug:
+        msg: "Discovered defaults saved to: /tmp/satellite_discovered_defaults.yml"
+      when: operation == 'discover_defaults'
+      tags:
+        - discover_defaults
+
+    # ========================================
+    # FIX PXE TEMPLATES
+    # ========================================
+    
+    - name: Fix PXE Templates - Check kickstart snippet exists
+      ansible.builtin.stat:
+        path: "{{ kickstart_snippet }}"
+      register: _snippet_stat
+      when: operation == 'fix_pxe_templates'
+      tags:
+        - fix_pxe_templates
+
+    - name: Fix PXE Templates - Fail if snippet not found
+      ansible.builtin.fail:
+        msg: |
+          Kickstart snippet not found at: {{ kickstart_snippet }}
+          
+          This might be a different Satellite version or custom installation.
+          Common locations:
+          - /usr/share/foreman/app/views/unattended/provisioning_templates/snippet/
+          - /var/lib/foreman/provisioning_templates/snippet/
+          
+          Search for it:
+          find / -name "kickstart_kernel_options.erb" 2>/dev/null
+      when:
+        - operation == 'fix_pxe_templates'
+        - not _snippet_stat.stat.exists
+      tags:
+        - fix_pxe_templates
+
+    - name: Fix PXE Templates - Backup snippet
+      ansible.builtin.copy:
+        src: "{{ kickstart_snippet }}"
+        dest: "{{ kickstart_snippet }}.backup.{{ ansible_date_time.epoch }}"
+        remote_src: true
+        mode: preserve
+      when:
+        - operation == 'fix_pxe_templates'
+        - _snippet_stat.stat.exists
+      tags:
+        - fix_pxe_templates
+
+    - name: Fix PXE Templates - Read current snippet
+      ansible.builtin.slurp:
+        src: "{{ kickstart_snippet }}"
+      register: _snippet_content
+      when:
+        - operation == 'fix_pxe_templates'
+        - _snippet_stat.stat.exists
+      tags:
+        - fix_pxe_templates
+
+    - name: Fix PXE Templates - Check for inst.stage2
+      ansible.builtin.set_fact:
+        _has_stage2: >-
+          {{ 'inst.stage2' in (_snippet_content.content | b64decode) }}
+      when:
+        - operation == 'fix_pxe_templates'
+        - _snippet_content is defined
+      tags:
+        - fix_pxe_templates
+
+    - name: Fix PXE Templates - Display current status
+      ansible.builtin.debug:
+        msg: |
+          Snippet location: {{ kickstart_snippet }}
+          Has inst.stage2: {{ _has_stage2 }}
+          Status: {{ 'Already configured' if _has_stage2 else 'Needs update' }}
+      when:
+        - operation == 'fix_pxe_templates'
+        - _has_stage2 is defined
+      tags:
+        - fix_pxe_templates
+
+    - name: Fix PXE Templates - Add inst.stage2 parameter
+      ansible.builtin.lineinfile:
+        path: "{{ kickstart_snippet }}"
+        insertafter: 'options = \[\]'
+        line: '  options.push("inst.stage2=#{medium_uri}") unless medium_uri.nil? || @host.architecture.to_s.match(/s390x?/i)'
+        backup: false
+      when:
+        - operation == 'fix_pxe_templates'
+        - _snippet_stat.stat.exists
+        - not _has_stage2
+      register: _snippet_fixed
+      tags:
+        - fix_pxe_templates
+
+    - name: Fix PXE Templates - Restart Foreman service
+      ansible.builtin.systemd:
+        name: foreman
+        state: restarted
+      when:
+        - operation == 'fix_pxe_templates'
+        - _snippet_fixed is changed
+      tags:
+        - fix_pxe_templates
+
+    - name: Fix PXE Templates - Wait for Foreman to restart
+      ansible.builtin.wait_for:
+        port: 443
+        delay: 5
+        timeout: 60
+      when:
+        - operation == 'fix_pxe_templates'
+        - _snippet_fixed is changed
+      tags:
+        - fix_pxe_templates
+
+    - name: Fix PXE Templates - Verify PXE config files
+      ansible.builtin.shell:
+        cmd: |
+          pxe_file=$(ls /var/lib/tftpboot/pxelinux.cfg/01-* 2>/dev/null | head -1)
+          if [ -n "$pxe_file" ]; then
+            if grep -q "inst.stage2" "$pxe_file"; then
+              echo "inst.stage2 PRESENT in PXE config"
+            else
+              echo "inst.stage2 MISSING - rebuild host configs"
+            fi
+          else
+            echo "No PXE configs found - create a host first"
+          fi
+      register: _verify_pxe
+      changed_when: false
+      failed_when: false
+      when: operation == 'fix_pxe_templates'
+      tags:
+        - fix_pxe_templates
+
+    - name: Fix PXE Templates - Summary
+      ansible.builtin.debug:
+        msg: |
+          ==========================================
+          PXE TEMPLATE FIX SUMMARY
+          ==========================================
+          
+          Kickstart Snippet: {{ 'UPDATED' if (_snippet_fixed is changed) else ('ALREADY CONFIGURED' if _has_stage2 else 'NO CHANGE') }}
+          Foreman Service: {{ 'RESTARTED' if (_snippet_fixed is changed) else 'NOT MODIFIED' }}
+          
+          Backup Created: {{ kickstart_snippet }}.backup.{{ ansible_date_time.epoch }}
+          
+          Verification: {{ _verify_pxe.stdout }}
+          
+          Next Steps:
+          {% if _snippet_fixed is changed %}
+          1. Rebuild existing host PXE configs:
+             hammer host rebuild-config --name HOST_NAME
+          
+          2. Or use the pxe_boot_troubleshoot playbook:
+             ansible-playbook pxe_boot_troubleshoot.yml \
+               -e host_name=node001.prod.spg \
+               -e vm_name=node001
+          {% endif %}
+          
+          3. New hosts will automatically use the fixed template
+          
+          4. Verify inst.stage2 in generated PXE configs:
+             grep "inst.stage2" /var/lib/tftpboot/pxelinux.cfg/01-*
+          
+          Troubleshooting:
+          - If dracut still flaps, check medium/content source is configured
+          - Verify repository is synced: hammer repository list
+          - Test repository URL accessibility from VM
+          ==========================================
+      when: operation == 'fix_pxe_templates'
+      tags:
+        - fix_pxe_templates
+
+  post_tasks:
+    - name: Operation complete
+      ansible.builtin.debug:
+        msg: |
+          ==========================================
+          OPERATION COMPLETE: {{ operation }}
+          ==========================================
+          
+          {% if operation == 'compute_profiles' %}
+          Compute profiles configured for PXE boot on {{ pxe_bridge }}
+          {% elif operation == 'discover_defaults' %}
+          Satellite defaults discovered and saved to /tmp/satellite_discovered_defaults.yml
+          {% elif operation == 'fix_pxe_templates' %}
+          PXE templates updated with inst.stage2 parameter
+          {% endif %}
+          
+          For help, see README.md in this directory.
+          ==========================================
+      tags: always

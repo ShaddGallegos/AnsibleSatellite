@@ -1,0 +1,724 @@
+---
+# Satellite Health Monitoring and Backup
+# Synopsis: Executes comprehensive Satellite health checks (services, disks, certificates) and performs configuration backups with retention and safety validations.
+# Unified playbook for health checks and configuration backups
+# Compatible with Ansible Automation Platform 2.6
+#
+# OPERATIONS:
+#   - health_check: Comprehensive Satellite health verification
+#   - backup: Backup Satellite configuration files
+#
+# USAGE:
+#   ansible-playbook satellite_health_monitoring.yml \
+#     -e operation=health_check \
+#     -e satellite_password=password
+
+- name: Satellite Health Monitoring and Backup
+  hosts: satellite
+  gather_facts: true
+  become: true
+  
+  vars:
+    # Operation to perform
+    operation: "{{ operation | default('') }}"
+    
+    # Authentication
+    satellite_user: "{{ satellite_user | default('admin') }}"
+    satellite_password: "{{ satellite_password | default(lookup('env', 'SATELLITE_PASSWORD')) }}"
+    satellite_url: "https://{{ inventory_hostname }}"
+    
+    # Backup Configuration
+    backup_root: "{{ backup_root | default('/root/satellite-config-backups') }}"
+    backup_retention_days: "{{ backup_retention_days | default(30) }}"
+    
+    # Health Check Configuration
+    satellite_services:
+      - foreman
+      - foreman-proxy
+      - httpd
+      - pulpcore-api
+      - pulpcore-worker@1
+      - pulpcore-worker@2
+      - pulpcore-content
+      - pulpcore-resource-manager
+      - postgresql
+      - redis
+      - named
+      - dhcpd
+      - tftp
+    
+    # Thresholds
+    disk_warning_threshold: "{{ disk_warning_threshold | default(80) }}"
+    disk_critical_threshold: "{{ disk_critical_threshold | default(90) }}"
+    
+    # API Settings
+    api_timeout: "{{ api_timeout | default(30) }}"
+
+  pre_tasks:
+    - name: Validate operation parameter
+      ansible.builtin.assert:
+        that:
+          - operation is defined
+          - operation in ['health_check', 'backup']
+        fail_msg: |
+          Invalid operation. Must be one of:
+          - health_check
+          - backup
+        success_msg: "Operation validated: {{ operation }}"
+      tags: always
+
+    - name: Validate credentials for health check
+      ansible.builtin.assert:
+        that:
+          - satellite_password | length > 0
+        fail_msg: "Satellite password required for health checks. Set via -e satellite_password=PASSWORD"
+        success_msg: "Credentials present"
+      no_log: true
+      when: operation == 'health_check'
+      tags: always
+
+  tasks:
+    # ========================================
+    # HEALTH CHECK OPERATION
+    # ========================================
+    
+    - name: Health Check - Check service status
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+      loop: "{{ satellite_services }}"
+      register: _service_status
+      failed_when: false
+      when: operation == 'health_check'
+      tags:
+        - health_check
+
+    - name: Health Check - Analyze service status
+      ansible.builtin.set_fact:
+        _services_running: >-
+          {{ _service_status.results | selectattr('status', 'defined') | 
+             selectattr('status.ActiveState', 'equalto', 'active') | 
+             map(attribute='item') | list }}
+        _services_failed: >-
+          {{ _service_status.results | selectattr('status', 'defined') | 
+             rejectattr('status.ActiveState', 'equalto', 'active') | 
+             map(attribute='item') | list }}
+        _services_missing: >-
+          {{ _service_status.results | rejectattr('status', 'defined') | 
+             map(attribute='item') | list }}
+      when: operation == 'health_check'
+      tags:
+        - health_check
+
+    - name: Health Check - Display service summary
+      ansible.builtin.debug:
+        msg: |
+          Service Status Summary:
+          Running: {{ _services_running | length }}/{{ satellite_services | length }}
+          Failed: {{ _services_failed | length }}
+          Missing: {{ _services_missing | length }}
+          
+          {% if _services_failed | length > 0 %}
+          Failed Services:
+          {% for svc in _services_failed %}
+          - {{ svc }}
+          {% endfor %}
+          {% endif %}
+          
+          {% if _services_missing | length > 0 %}
+          Missing Services (not installed):
+          {% for svc in _services_missing %}
+          - {{ svc }}
+          {% endfor %}
+          {% endif %}
+      when: operation == 'health_check'
+      tags:
+        - health_check
+
+    - name: Health Check - Check Satellite API status
+      ansible.builtin.uri:
+        url: "{{ satellite_url }}/api/status"
+        method: GET
+        user: "{{ satellite_user }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        return_content: true
+        status_code: 200
+        timeout: "{{ api_timeout }}"
+      register: _api_status
+      failed_when: false
+      no_log: true
+      when: operation == 'health_check'
+      tags:
+        - health_check
+
+    - name: Health Check - Display API status
+      ansible.builtin.debug:
+        msg: |
+          Satellite API Status: {{ 'ONLINE' if _api_status.status == 200 else 'OFFLINE' }}
+          {% if _api_status.json is defined %}
+          Version: {{ _api_status.json.version | default('Unknown') }}
+          API Version: {{ _api_status.json.api_version | default('Unknown') }}
+          {% endif %}
+      when:
+        - operation == 'health_check'
+        - _api_status is defined
+      tags:
+        - health_check
+
+    - name: Health Check - Check Katello API
+      ansible.builtin.uri:
+        url: "{{ satellite_url }}/katello/api/status"
+        method: GET
+        user: "{{ satellite_user }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        return_content: true
+        status_code: 200
+        timeout: "{{ api_timeout }}"
+      register: _katello_status
+      failed_when: false
+      no_log: true
+      when: operation == 'health_check'
+      tags:
+        - health_check
+
+    - name: Health Check - Display Katello status
+      ansible.builtin.debug:
+        msg: |
+          Katello API Status: {{ 'ONLINE' if _katello_status.status == 200 else 'OFFLINE' }}
+          {% if _katello_status.json is defined %}
+          {% for key, value in _katello_status.json.items() %}
+          {{ key }}: {{ value }}
+          {% endfor %}
+          {% endif %}
+      when:
+        - operation == 'health_check'
+        - _katello_status is defined
+        - _katello_status.json is defined
+      tags:
+        - health_check
+
+    - name: Health Check - Check DNS resolution
+      ansible.builtin.command:
+        cmd: dig @localhost {{ inventory_hostname }} +short
+      register: _dns_check
+      changed_when: false
+      failed_when: false
+      when: operation == 'health_check'
+      tags:
+        - health_check
+
+    - name: Health Check - Display DNS status
+      ansible.builtin.debug:
+        msg: |
+          DNS Resolution: {{ 'OK' if _dns_check.rc == 0 and _dns_check.stdout | length > 0 else 'FAILED' }}
+          {% if _dns_check.stdout | length > 0 %}
+          Resolved to: {{ _dns_check.stdout_lines | join(', ') }}
+          {% endif %}
+      when:
+        - operation == 'health_check'
+        - _dns_check is defined
+      tags:
+        - health_check
+
+    - name: Health Check - Check DHCP leases
+      ansible.builtin.shell:
+        cmd: |
+          if command -v dhcp-lease-list &> /dev/null; then
+            dhcp-lease-list --lease /var/lib/dhcpd/dhcpd.leases 2>/dev/null | grep -v "^Reading" | wc -l
+          else
+            grep "^lease" /var/lib/dhcpd/dhcpd.leases 2>/dev/null | wc -l
+          fi
+      register: _dhcp_leases
+      changed_when: false
+      failed_when: false
+      when: operation == 'health_check'
+      tags:
+        - health_check
+
+    - name: Health Check - Display DHCP status
+      ansible.builtin.debug:
+        msg: "Active DHCP leases: {{ _dhcp_leases.stdout | trim }}"
+      when:
+        - operation == 'health_check'
+        - _dhcp_leases is defined
+      tags:
+        - health_check
+
+    - name: Health Check - Check TFTP directory
+      ansible.builtin.stat:
+        path: /var/lib/tftpboot
+      register: _tftp_dir
+      when: operation == 'health_check'
+      tags:
+        - health_check
+
+    - name: Health Check - Count PXE boot files
+      ansible.builtin.find:
+        paths: /var/lib/tftpboot/boot
+        patterns:
+          - '*vmlinuz*'
+          - '*initrd*'
+        recurse: true
+      register: _boot_files
+      when:
+        - operation == 'health_check'
+        - _tftp_dir.stat.exists
+      tags:
+        - health_check
+
+    - name: Health Check - Count PXE config files
+      ansible.builtin.find:
+        paths:
+          - /var/lib/tftpboot/pxelinux.cfg
+          - /var/lib/tftpboot/grub2
+        patterns:
+          - '01-*'
+          - 'grub.cfg-01-*'
+      register: _pxe_configs
+      when:
+        - operation == 'health_check'
+        - _tftp_dir.stat.exists
+      failed_when: false
+      tags:
+        - health_check
+
+    - name: Health Check - Display TFTP status
+      ansible.builtin.debug:
+        msg: |
+          TFTP Status:
+          Directory: {{ 'EXISTS' if _tftp_dir.stat.exists else 'MISSING' }}
+          Boot files: {{ _boot_files.matched | default(0) }}
+          PXE configs: {{ _pxe_configs.matched | default(0) }}
+      when:
+        - operation == 'health_check'
+        - _tftp_dir is defined
+      tags:
+        - health_check
+
+    - name: Health Check - Check disk space
+      ansible.builtin.shell:
+        cmd: df -h / /var /var/lib/pulp | tail -n +2
+      register: _disk_space
+      changed_when: false
+      when: operation == 'health_check'
+      tags:
+        - health_check
+
+    - name: Health Check - Analyze disk usage
+      ansible.builtin.set_fact:
+        _disk_warnings: []
+        _disk_critical: []
+      when: operation == 'health_check'
+      tags:
+        - health_check
+
+    - name: Health Check - Check for disk warnings
+      ansible.builtin.set_fact:
+        _disk_warnings: >-
+          {{ _disk_warnings + [item] }}
+      loop: "{{ _disk_space.stdout_lines }}"
+      when:
+        - operation == 'health_check'
+        - item.split() | length > 4
+        - item.split()[4] | regex_replace('%', '') | int >= disk_warning_threshold
+        - item.split()[4] | regex_replace('%', '') | int < disk_critical_threshold
+      tags:
+        - health_check
+
+    - name: Health Check - Check for critical disk usage
+      ansible.builtin.set_fact:
+        _disk_critical: >-
+          {{ _disk_critical + [item] }}
+      loop: "{{ _disk_space.stdout_lines }}"
+      when:
+        - operation == 'health_check'
+        - item.split() | length > 4
+        - item.split()[4] | regex_replace('%', '') | int >= disk_critical_threshold
+      tags:
+        - health_check
+
+    - name: Health Check - Display disk status
+      ansible.builtin.debug:
+        msg: |
+          Disk Space:
+          {{ _disk_space.stdout }}
+          
+          {% if _disk_critical | length > 0 %}
+          CRITICAL: The following filesystems are above {{ disk_critical_threshold }}%:
+          {% for disk in _disk_critical %}
+          - {{ disk }}
+          {% endfor %}
+          {% endif %}
+          
+          {% if _disk_warnings | length > 0 %}
+          WARNING: The following filesystems are above {{ disk_warning_threshold }}%:
+          {% for disk in _disk_warnings %}
+          - {{ disk }}
+          {% endfor %}
+          {% endif %}
+      when: operation == 'health_check'
+      tags:
+        - health_check
+
+    - name: Health Check - Check recent Foreman errors
+      ansible.builtin.shell:
+        cmd: tail -100 /var/log/foreman/production.log | grep -i error | tail -10
+      register: _foreman_errors
+      changed_when: false
+      failed_when: false
+      when: operation == 'health_check'
+      tags:
+        - health_check
+
+    - name: Health Check - Display recent errors
+      ansible.builtin.debug:
+        msg: |
+          Recent Foreman Errors (last 10 from recent 100 lines):
+          {% if _foreman_errors.stdout_lines | length > 0 %}
+          {% for error in _foreman_errors.stdout_lines %}
+          {{ error }}
+          {% endfor %}
+          {% else %}
+          No recent errors found
+          {% endif %}
+      when:
+        - operation == 'health_check'
+        - _foreman_errors is defined
+      tags:
+        - health_check
+
+    - name: Health Check - Get repository sync status
+      ansible.builtin.uri:
+        url: "{{ satellite_url }}/katello/api/repositories"
+        method: GET
+        user: "{{ satellite_user }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        return_content: true
+        status_code: 200
+        timeout: "{{ api_timeout }}"
+      register: _repo_status
+      failed_when: false
+      no_log: true
+      when: operation == 'health_check'
+      tags:
+        - health_check
+
+    - name: Health Check - Analyze repository sync
+      ansible.builtin.set_fact:
+        _total_repos: "{{ _repo_status.json.total | default(0) }}"
+        _synced_repos: >-
+          {{ _repo_status.json.results | default([]) | 
+             selectattr('last_sync', 'defined') | 
+             selectattr('last_sync', '!=', None) | 
+             list | length }}
+      when:
+        - operation == 'health_check'
+        - _repo_status.json is defined
+      tags:
+        - health_check
+
+    - name: Health Check - Display repository status
+      ansible.builtin.debug:
+        msg: |
+          Repository Status:
+          Total: {{ _total_repos | default(0) }}
+          Synced: {{ _synced_repos | default(0) }}
+          Never Synced: {{ (_total_repos | default(0) | int) - (_synced_repos | default(0) | int) }}
+      when:
+        - operation == 'health_check'
+        - _total_repos is defined
+      tags:
+        - health_check
+
+    - name: Health Check - Generate comprehensive summary
+      ansible.builtin.debug:
+        msg: |
+          ==========================================
+          SATELLITE HEALTH CHECK SUMMARY
+          ==========================================
+          
+          System Information:
+          - Hostname: {{ inventory_hostname }}
+          - Satellite Version: {{ _api_status.json.version | default('Unknown') if _api_status.json is defined else 'Unknown' }}
+          
+          Service Health:
+          - Running: {{ _services_running | length }}/{{ satellite_services | length }}
+          - Failed: {{ _services_failed | length }}
+          - Missing: {{ _services_missing | length }}
+          
+          API Status:
+          - Satellite API: {{ 'ONLINE' if _api_status.status == 200 else 'OFFLINE' }}
+          - Katello API: {{ 'ONLINE' if _katello_status.status == 200 else 'OFFLINE' }}
+          
+          Infrastructure:
+          - DNS Resolution: {{ 'OK' if _dns_check.rc == 0 else 'FAILED' }}
+          - DHCP Leases: {{ _dhcp_leases.stdout | trim }}
+          - TFTP Directory: {{ 'OK' if _tftp_dir.stat.exists else 'MISSING' }}
+          - Boot Files: {{ _boot_files.matched | default(0) }}
+          - PXE Configs: {{ _pxe_configs.matched | default(0) }}
+          
+          Storage:
+          - Disk Warnings: {{ _disk_warnings | length }}
+          - Disk Critical: {{ _disk_critical | length }}
+          
+          Content:
+          - Total Repositories: {{ _total_repos | default('N/A') }}
+          - Synced Repositories: {{ _synced_repos | default('N/A') }}
+          
+          Overall Status: {{ 'HEALTHY' if (_services_failed | length == 0 and _disk_critical | length == 0 and _api_status.status == 200) else 'ISSUES DETECTED' }}
+          
+          {% if _services_failed | length > 0 or _disk_critical | length > 0 %}
+          Action Required:
+          {% if _services_failed | length > 0 %}
+          - Restart failed services: systemctl restart {{ _services_failed | join(' ') }}
+          {% endif %}
+          {% if _disk_critical | length > 0 %}
+          - Free up disk space on critical filesystems
+          {% endif %}
+          {% endif %}
+          ==========================================
+      when: operation == 'health_check'
+      tags:
+        - health_check
+
+    # ========================================
+    # BACKUP OPERATION
+    # ========================================
+    
+    - name: Backup - Set timestamp
+      ansible.builtin.set_fact:
+        _backup_timestamp: "{{ ansible_date_time.date }}-{{ ansible_date_time.hour }}{{ ansible_date_time.minute }}{{ ansible_date_time.second }}"
+      when: operation == 'backup'
+      tags:
+        - backup
+
+    - name: Backup - Set paths
+      ansible.builtin.set_fact:
+        _backup_dir: "{{ backup_root }}/backup-{{ _backup_timestamp }}"
+        _archive_path: "{{ backup_root }}/satellite-config-backup-{{ _backup_timestamp }}.tar.gz"
+      when: operation == 'backup'
+      tags:
+        - backup
+
+    - name: Backup - Create backup directory
+      ansible.builtin.file:
+        path: "{{ _backup_dir }}"
+        state: directory
+        mode: '0700'
+      when: operation == 'backup'
+      tags:
+        - backup
+
+    - name: Backup - DNS/named configuration
+      ansible.builtin.copy:
+        src: "{{ item }}"
+        dest: "{{ _backup_dir }}/dns/"
+        remote_src: true
+      loop:
+        - /etc/named.conf
+        - /etc/named
+        - /var/named
+      failed_when: false
+      when: operation == 'backup'
+      tags:
+        - backup
+
+    - name: Backup - DHCP configuration
+      ansible.builtin.copy:
+        src: "{{ item }}"
+        dest: "{{ _backup_dir }}/dhcp/"
+        remote_src: true
+      loop:
+        - /etc/dhcp
+        - /var/lib/dhcpd
+      failed_when: false
+      when: operation == 'backup'
+      tags:
+        - backup
+
+    - name: Backup - TFTP configuration
+      ansible.builtin.copy:
+        src: /var/lib/tftpboot
+        dest: "{{ _backup_dir }}/tftp/"
+        remote_src: true
+      failed_when: false
+      when: operation == 'backup'
+      tags:
+        - backup
+
+    - name: Backup - PXE/Grub configuration
+      ansible.builtin.copy:
+        src: "{{ item }}"
+        dest: "{{ _backup_dir }}/pxe/"
+        remote_src: true
+      loop:
+        - /etc/grub2.cfg
+        - /etc/default/grub
+        - /var/lib/tftpboot/pxelinux.cfg
+        - /var/lib/tftpboot/grub2
+      failed_when: false
+      when: operation == 'backup'
+      tags:
+        - backup
+
+    - name: Backup - Foreman/Satellite configuration
+      ansible.builtin.copy:
+        src: "{{ item }}"
+        dest: "{{ _backup_dir }}/foreman/"
+        remote_src: true
+      loop:
+        - /etc/foreman
+        - /etc/foreman-proxy
+        - /etc/katello
+      failed_when: false
+      when: operation == 'backup'
+      tags:
+        - backup
+
+    - name: Backup - Ansible configuration
+      ansible.builtin.copy:
+        src: "{{ item }}"
+        dest: "{{ _backup_dir }}/ansible/"
+        remote_src: true
+      loop:
+        - /etc/ansible
+        - /var/lib/awx
+      failed_when: false
+      when: operation == 'backup'
+      tags:
+        - backup
+
+    - name: Backup - Command history files
+      ansible.builtin.shell:
+        cmd: |
+          mkdir -p {{ _backup_dir }}/history
+          cp -a /root/.bash_history {{ _backup_dir }}/history/root_bash_history 2>/dev/null || true
+          find /home -name .bash_history -exec cp {} {{ _backup_dir }}/history/ \; 2>/dev/null || true
+      changed_when: false
+      when: operation == 'backup'
+      tags:
+        - backup
+
+    - name: Backup - Extract installer history
+      ansible.builtin.shell:
+        cmd: |
+          grep -i "satellite-installer" -R /root /home 2>/dev/null > {{ _backup_dir }}/satellite_installer_history.txt || true
+          grep -i "foreman-installer" -R /root /home 2>/dev/null >> {{ _backup_dir }}/foreman_installer_history.txt || true
+      changed_when: false
+      when: operation == 'backup'
+      tags:
+        - backup
+
+    - name: Backup - Save system information
+      ansible.builtin.shell:
+        cmd: |
+          cat > {{ _backup_dir }}/system_info.txt << EOF
+          Backup Date: {{ ansible_date_time.iso8601 }}
+          Hostname: {{ inventory_hostname }}
+          Satellite Version: {{ ansible_local.satellite.version | default('Unknown') }}
+          OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
+          Kernel: {{ ansible_kernel }}
+          EOF
+      changed_when: false
+      when: operation == 'backup'
+      tags:
+        - backup
+
+    - name: Backup - Create compressed archive
+      community.general.archive:
+        path: "{{ _backup_dir }}"
+        dest: "{{ _archive_path }}"
+        format: gz
+        remove: true
+      when: operation == 'backup'
+      tags:
+        - backup
+
+    - name: Backup - Get archive size
+      ansible.builtin.stat:
+        path: "{{ _archive_path }}"
+      register: _archive_stat
+      when: operation == 'backup'
+      tags:
+        - backup
+
+    - name: Backup - Remove old backups
+      ansible.builtin.find:
+        paths: "{{ backup_root }}"
+        patterns: 'satellite-config-backup-*.tar.gz'
+        age: "{{ backup_retention_days }}d"
+      register: _old_backups
+      when: operation == 'backup'
+      tags:
+        - backup
+
+    - name: Backup - Delete old backup files
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ _old_backups.files | default([]) }}"
+      when:
+        - operation == 'backup'
+        - _old_backups.files is defined
+      tags:
+        - backup
+
+    - name: Backup - Summary
+      ansible.builtin.debug:
+        msg: |
+          ==========================================
+          BACKUP COMPLETE
+          ==========================================
+          
+          Backup Location: {{ _archive_path }}
+          Archive Size: {{ (_archive_stat.stat.size / 1024 / 1024) | round(2) }} MB
+          
+          Backup Contents:
+          - DNS/named configuration
+          - DHCP configuration
+          - TFTP boot files
+          - PXE/Grub configuration
+          - Foreman/Satellite configuration
+          - Ansible configuration
+          - Command history files
+          - Installer history
+          - System information
+          
+          Old Backups Removed: {{ _old_backups.files | default([]) | length }}
+          Retention Policy: {{ backup_retention_days }} days
+          
+          Restore Instructions:
+          1. Extract: tar -xzf {{ _archive_path }}
+          2. Review contents before restoring
+          3. Copy files back to original locations
+          4. Restart affected services
+          
+          ==========================================
+      when:
+        - operation == 'backup'
+        - _archive_stat is defined
+      tags:
+        - backup
+
+  post_tasks:
+    - name: Operation complete
+      ansible.builtin.debug:
+        msg: |
+          ==========================================
+          OPERATION COMPLETE: {{ operation }}
+          ==========================================
+          
+          {% if operation == 'health_check' %}
+          Health check completed. Review output above for any issues.
+          {% elif operation == 'backup' %}
+          Backup created at: {{ _archive_path }}
+          {% endif %}
+          
+          For help, see README.md in this directory.
+          ==========================================
+      tags: always

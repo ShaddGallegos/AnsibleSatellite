@@ -1,0 +1,719 @@
+---
+# Unified Satellite Node Management Playbook
+# Synopsis: Provides unified CRUD operations (create, bulk, delete, list) for Satellite hosts with slot management, MAC generation, retry logic, and inventory summaries.
+# Consolidates create, delete, list, and batch operations
+# Enhanced with error handling, retries, and fallback options
+#
+# OPERATIONS:
+#   create  - Create single node with auto-slot allocation
+#   bulk    - Create multiple consecutive nodes
+#   delete  - Remove node and free slot
+#   list    - Display all nodes and available slots
+#
+# USAGE EXAMPLES:
+#
+# List nodes:
+#   ansible-playbook satellite_node_manager.yml -e operation=list
+#
+# Create single node:
+#   ansible-playbook satellite_node_manager.yml -e operation=create -e mac_address=52:54:00:aa:bb:cc
+#
+# Bulk create:
+#   ansible-playbook satellite_node_manager.yml -e operation=bulk -e node_count=10
+#
+# Delete node:
+#   ansible-playbook satellite_node_manager.yml -e operation=delete -e node_number=42
+
+- name: Satellite Node Management
+  hosts: satellite
+  gather_facts: true
+  become: true
+  
+  vars:
+    # Operation type (create, bulk, delete, list)
+    operation: "{{ operation | default('list') }}"
+    
+    # Node naming
+    node_prefix: "node"
+    node_start: 1
+    node_end: 999
+    domain: "{{ domain | default('prod.spg') }}"
+    
+    # Satellite connection
+    satellite_host: "{{ satellite_host | default('satellite.prod.spg') }}"
+    satellite_user: "{{ satellite_user | default('admin') }}"
+    satellite_password: "{{ satellite_password | default(lookup('env', 'SATELLITE_PASSWORD')) }}"
+    
+    # Satellite resource IDs (defaults, can be overridden)
+    os_id: "{{ os_id | default(1) }}"
+    hostgroup_id: "{{ hostgroup_id | default(1) }}"
+    subnet_id: "{{ subnet_id | default(1) }}"
+    location_id: "{{ location_id | default(2) }}"
+    organization_id: "{{ organization_id | default(1) }}"
+    # Optional resource name lookups (if provided, IDs will be auto-resolved and override above)
+    os_name: "{{ os_name | default(omit) }}"
+    hostgroup_name: "{{ hostgroup_name | default(omit) }}"
+    subnet_name: "{{ subnet_name | default(omit) }}"
+    location_name: "{{ location_name | default(omit) }}"
+    organization_name: "{{ organization_name | default(omit) }}"
+    
+    # MAC address configuration
+    mac_address_prefix: "{{ mac_address_prefix | default('52:54:00:aa:bb') }}"
+    random_mac: "{{ random_mac | default(false) }}"  # If true, auto-generate MAC (last octet randomized) for single create; bulk uses time-based variant
+    
+    # API retry configuration
+    api_retry_count: "{{ api_retry_count | default(3) }}"
+    api_retry_delay: "{{ api_retry_delay | default(5) }}"
+    
+    # Confirmation settings
+    require_confirmation: "{{ require_confirmation | default(true) }}"
+    confirmation_timeout: "{{ confirmation_timeout | default(3) }}"
+    # Export settings (CSV). When defined, results of create/bulk operations will be written locally.
+    export_path: "{{ export_path | default(omit) }}"
+
+  pre_tasks:
+    - name: Validate operation parameter
+      ansible.builtin.assert:
+        that:
+          - operation in ['create', 'bulk', 'delete', 'list']
+        fail_msg: "Invalid operation '{{ operation }}'. Must be: create, bulk, delete, or list"
+        success_msg: "Operation '{{ operation }}' validated"
+      tags: always
+
+    - name: Check Satellite credentials
+      ansible.builtin.assert:
+        that:
+          - satellite_password | length > 0
+        fail_msg: |
+          Satellite password not provided.
+          Set via: -e satellite_password=PASSWORD
+          Or environment: export SATELLITE_PASSWORD=password
+        success_msg: "Satellite credentials present"
+      no_log: true
+      tags: always
+
+    - name: Test Satellite API connectivity
+      ansible.builtin.uri:
+        url: "https://{{ satellite_host }}/api/status"
+        method: GET
+        user: "{{ satellite_user }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: 200
+      register: _sat_api_test
+      retries: "{{ api_retry_count }}"
+      delay: "{{ api_retry_delay }}"
+      until: _sat_api_test.status == 200
+      failed_when: false
+      changed_when: false
+      no_log: true
+      tags: always
+
+    - name: Handle API connectivity failure
+      block:
+        - name: Display connectivity error
+          ansible.builtin.debug:
+            msg: |
+              Failed to connect to Satellite API
+              URL: https://{{ satellite_host }}/api/status
+              Status: {{ _sat_api_test.status | default('No response') }}
+              
+              Troubleshooting:
+              1. Verify Satellite is running: systemctl status foreman
+              2. Check credentials: curl -k -u {{ satellite_user }}:*** https://{{ satellite_host }}/api/status
+              3. Verify network connectivity: ping {{ satellite_host }}
+              4. Check firewall: firewall-cmd --list-services
+
+        - name: Fail after troubleshooting info
+          ansible.builtin.fail:
+            msg: "Cannot proceed without Satellite API connectivity"
+      when: _sat_api_test is failed
+      tags: always
+
+    - name: Display API connectivity success
+      ansible.builtin.debug:
+        msg: "Successfully connected to Satellite API at {{ satellite_host }}"
+      when: _sat_api_test is succeeded
+      tags: always
+
+    - name: Lookup operating system ID by name (optional)
+      ansible.builtin.uri:
+        url: "https://{{ satellite_host }}/api/operatingsystems?search=name={{ os_name | urlencode }}"
+        method: GET
+        user: "{{ satellite_user }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: 200
+      register: _os_lookup
+      when: os_name is defined
+      no_log: true
+      changed_when: false
+
+    - name: Validate OS lookup result
+      ansible.builtin.assert:
+        that:
+          - _os_lookup.json.results | length > 0
+        fail_msg: "Operating System name '{{ os_name }}' not found"
+      when: os_name is defined
+
+    - name: Set OS ID from name
+      ansible.builtin.set_fact:
+        os_id: "{{ _os_lookup.json.results[0].id }}"
+      when: os_name is defined
+
+    - name: Lookup hostgroup ID by name (optional)
+      ansible.builtin.uri:
+        url: "https://{{ satellite_host }}/api/hostgroups?search=name={{ hostgroup_name | urlencode }}"
+        method: GET
+        user: "{{ satellite_user }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: 200
+      register: _hg_lookup
+      when: hostgroup_name is defined
+      no_log: true
+      changed_when: false
+
+    - name: Validate hostgroup lookup result
+      ansible.builtin.assert:
+        that:
+          - _hg_lookup.json.results | length > 0
+        fail_msg: "Hostgroup name '{{ hostgroup_name }}' not found"
+      when: hostgroup_name is defined
+
+    - name: Set hostgroup ID from name
+      ansible.builtin.set_fact:
+        hostgroup_id: "{{ _hg_lookup.json.results[0].id }}"
+      when: hostgroup_name is defined
+
+    - name: Lookup subnet ID by name (optional)
+      ansible.builtin.uri:
+        url: "https://{{ satellite_host }}/api/subnets?search=name={{ subnet_name | urlencode }}"
+        method: GET
+        user: "{{ satellite_user }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: 200
+      register: _subnet_lookup
+      when: subnet_name is defined
+      no_log: true
+      changed_when: false
+
+    - name: Validate subnet lookup result
+      ansible.builtin.assert:
+        that:
+          - _subnet_lookup.json.results | length > 0
+        fail_msg: "Subnet name '{{ subnet_name }}' not found"
+      when: subnet_name is defined
+
+    - name: Set subnet ID from name
+      ansible.builtin.set_fact:
+        subnet_id: "{{ _subnet_lookup.json.results[0].id }}"
+      when: subnet_name is defined
+
+    - name: Lookup location ID by name (optional)
+      ansible.builtin.uri:
+        url: "https://{{ satellite_host }}/api/locations?search=name={{ location_name | urlencode }}"
+        method: GET
+        user: "{{ satellite_user }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: 200
+      register: _location_lookup
+      when: location_name is defined
+      no_log: true
+      changed_when: false
+
+    - name: Validate location lookup result
+      ansible.builtin.assert:
+        that:
+          - _location_lookup.json.results | length > 0
+        fail_msg: "Location name '{{ location_name }}' not found"
+      when: location_name is defined
+
+    - name: Set location ID from name
+      ansible.builtin.set_fact:
+        location_id: "{{ _location_lookup.json.results[0].id }}"
+      when: location_name is defined
+
+    - name: Lookup organization ID by name (optional)
+      ansible.builtin.uri:
+        url: "https://{{ satellite_host }}/api/organizations?search=name={{ organization_name | urlencode }}"
+        method: GET
+        user: "{{ satellite_user }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: 200
+      register: _org_lookup
+      when: organization_name is defined
+      no_log: true
+      changed_when: false
+
+    - name: Validate organization lookup result
+      ansible.builtin.assert:
+        that:
+          - _org_lookup.json.results | length > 0
+        fail_msg: "Organization name '{{ organization_name }}' not found"
+      when: organization_name is defined
+
+    - name: Set organization ID from name
+      ansible.builtin.set_fact:
+        organization_id: "{{ _org_lookup.json.results[0].id }}"
+      when: organization_name is defined
+
+    - name: Display resolved resource IDs
+      ansible.builtin.debug:
+        msg: |
+          Resource ID Summary (post-lookup)
+          ---------------------------------
+          Operating System ID: {{ os_id }} {{ '(from ' + os_name + ')' if os_name is defined else '' }}
+          Hostgroup ID:       {{ hostgroup_id }} {{ '(from ' + hostgroup_name + ')' if hostgroup_name is defined else '' }}
+          Subnet ID:          {{ subnet_id }} {{ '(from ' + subnet_name + ')' if subnet_name is defined else '' }}
+          Location ID:        {{ location_id }} {{ '(from ' + location_name + ')' if location_name is defined else '' }}
+          Organization ID:    {{ organization_id }} {{ '(from ' + organization_name + ')' if organization_name is defined else '' }}
+      tags: always
+
+  tasks:
+    - name: Get all existing hosts from Satellite
+      ansible.builtin.uri:
+        url: "https://{{ satellite_host }}/api/hosts?per_page=10000"
+        method: GET
+        user: "{{ satellite_user }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        return_content: true
+        status_code: 200
+      register: _existing_hosts
+      retries: "{{ api_retry_count }}"
+      delay: "{{ api_retry_delay }}"
+      until: _existing_hosts.status == 200
+      no_log: true
+      changed_when: false
+      tags: always
+
+    - name: Extract node information
+      ansible.builtin.set_fact:
+        _all_hosts: "{{ _existing_hosts.json.results | default([]) }}"
+        _node_hosts: "{{ _existing_hosts.json.results | default([]) | selectattr('name', 'match', '^' + node_prefix + '[0-9]{3}\\.' + domain + '$') | list }}"
+      tags: always
+
+    - name: Parse existing node numbers
+      ansible.builtin.set_fact:
+        _existing_node_numbers: "{{ _node_hosts | map(attribute='name') | map('regex_replace', '^' + node_prefix + '([0-9]{3})\\..*', '\\1') | map('int') | list }}"
+      tags: always
+
+    - name: Calculate available slots
+      ansible.builtin.set_fact:
+        _available_slots: "{{ range(node_start, node_end + 1) | list | difference(_existing_node_numbers) }}"
+      tags: always
+
+    - name: Display node inventory summary
+      ansible.builtin.debug:
+        msg: |
+          Node Inventory Summary
+          =====================
+          Existing nodes: {{ _existing_node_numbers | length }}
+          Available slots: {{ _available_slots | length }}
+          First available: {{ node_prefix }}{{ '%03d' | format(_available_slots[0]) }}.{{ domain if _available_slots | length > 0 else 'N/A' }}
+      tags: always
+
+    # LIST OPERATION
+    - name: List operation - Display detailed inventory
+      block:
+        - name: Format node details
+          ansible.builtin.set_fact:
+            _node_details: |
+              
+              PXE Node Inventory ({{ node_prefix }}{{ '%03d' | format(node_start) }}-{{ node_prefix }}{{ '%03d' | format(node_end) }})
+              ================================================================================
+              
+              EXISTING NODES ({{ _existing_node_numbers | length }} total)
+              --------------------------------------------------------------------------------
+              {% for host in _node_hosts %}
+              {{ '%-25s' | format(host.name) }} IP: {{ '%-15s' | format(host.ip | default('N/A')) }} MAC: {{ '%-17s' | format(host.mac | default('N/A')) }} Build: {{ host.build | default(false) }}
+              {% endfor %}
+              
+              AVAILABLE SLOTS ({{ _available_slots | length }} total)
+              --------------------------------------------------------------------------------
+              First 20 available:
+              {% for num in _available_slots[:20] %}{{ node_prefix }}{{ '%03d' | format(num) }}{% if not loop.last %}, {% endif %}{% endfor %}
+              
+              Next available: {{ node_prefix }}{{ '%03d' | format(_available_slots[0]) }}.{{ domain if _available_slots | length > 0 else 'N/A' }}
+              
+              USAGE EXAMPLES
+              --------------------------------------------------------------------------------
+              Create single: ansible-playbook satellite_node_manager.yml -e operation=create -e mac_address=52:54:00:xx:xx:xx
+              Bulk create:   ansible-playbook satellite_node_manager.yml -e operation=bulk -e node_count=10
+              Delete node:   ansible-playbook satellite_node_manager.yml -e operation=delete -e node_number=42
+
+        - name: Display inventory
+          ansible.builtin.debug:
+            msg: "{{ _node_details.split('\n') }}"
+      when: operation == 'list'
+      tags: list
+
+    # CREATE OPERATION
+    - name: Create single node operation
+      block:
+        - name: Validate create parameters
+          ansible.builtin.assert:
+            that:
+              - (mac_address is defined) or (random_mac | bool)
+              - (random_mac | bool) or (mac_address | regex_search('^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$'))
+              - _available_slots | length > 0
+            fail_msg: |
+              Create operation requires:
+              - mac_address parameter (format: XX:XX:XX:XX:XX:XX) OR random_mac=true
+              - At least one available node slot
+              Current available slots: {{ _available_slots | length }}
+            success_msg: "Create parameters validated"
+
+        - name: Generate random MAC (single create)
+          ansible.builtin.set_fact:
+            mac_address: "{{ mac_address_prefix + ':' + '%02x' | format(((ansible_date_time.epoch | int) + _available_slots[0]) % 256) }}"
+          when: random_mac | bool and mac_address is not defined
+
+        - name: Select first available slot
+          ansible.builtin.set_fact:
+            _selected_node_num: "{{ _available_slots[0] }}"
+            _selected_node_name: "{{ node_prefix }}{{ '%03d' | format(_available_slots[0]) }}"
+            _selected_node_fqdn: "{{ node_prefix }}{{ '%03d' | format(_available_slots[0]) }}.{{ domain }}"
+
+        - name: Display node creation plan
+          ansible.builtin.debug:
+            msg: |
+              Node Creation Plan
+              ==================
+              Node number: {{ _selected_node_num }}
+              Node name: {{ _selected_node_name }}
+              FQDN: {{ _selected_node_fqdn }}
+              MAC address: {{ mac_address }}
+              Domain: {{ domain }}
+              OS ID: {{ os_id }}
+              Hostgroup ID: {{ hostgroup_id }}
+
+        - name: Confirmation pause
+          ansible.builtin.pause:
+            seconds: "{{ confirmation_timeout }}"
+            prompt: "Creating {{ _selected_node_fqdn }} in {{ confirmation_timeout }} seconds (Ctrl+C to abort)"
+          when: require_confirmation | bool
+
+        - name: Create host in Satellite
+          ansible.builtin.uri:
+            url: "https://{{ satellite_host }}/api/hosts"
+            method: POST
+            user: "{{ satellite_user }}"
+            password: "{{ satellite_password }}"
+            force_basic_auth: true
+            validate_certs: false
+            body_format: json
+            body:
+              host:
+                name: "{{ _selected_node_name }}"
+                mac: "{{ mac_address }}"
+                operatingsystem_id: "{{ os_id }}"
+                hostgroup_id: "{{ hostgroup_id }}"
+                subnet_id: "{{ subnet_id }}"
+                location_id: "{{ location_id }}"
+                organization_id: "{{ organization_id }}"
+                build: true
+                enabled: true
+                managed: true
+            status_code: 201
+          register: _create_result
+          retries: "{{ api_retry_count }}"
+          delay: "{{ api_retry_delay }}"
+          until: _create_result.status == 201
+          no_log: true
+
+        - name: Display creation success
+          ansible.builtin.debug:
+            msg: |
+              Node Created Successfully
+              =========================
+              Name: {{ _create_result.json.name }}
+              ID: {{ _create_result.json.id }}
+              IP: {{ _create_result.json.ip | default('Will be assigned via DHCP') }}
+              MAC: {{ _create_result.json.mac }}
+              Build mode: {{ _create_result.json.build }}
+
+        - name: Export single creation CSV
+          ansible.builtin.copy:
+            dest: "{{ export_path }}"
+            content: "name,id,mac,slot,timestamp\n{{ _create_result.json.name }},{{ _create_result.json.id }},{{ _create_result.json.mac }},{{ _selected_node_num }},{{ ansible_date_time.iso8601 }}\n"
+          when: export_path is defined
+          delegate_to: localhost
+      rescue:
+        - name: Display creation error
+          ansible.builtin.debug:
+            msg: |
+              Node creation failed
+              Error: {{ _create_result.msg | default('Unknown error') }}
+              
+              Troubleshooting:
+              1. Verify MAC address is not already in use
+              2. Check Satellite logs: tail -f /var/log/foreman/production.log
+              3. Verify resource IDs are valid (os_id, hostgroup_id, etc.)
+              4. Test manually: hammer host create --name test --mac 52:54:00:xx:xx:xx
+
+        - name: Fail with error details
+          ansible.builtin.fail:
+            msg: "Host creation failed. See troubleshooting info above."
+      when: operation == 'create'
+      tags: create
+
+    # BULK OPERATION
+    - name: Bulk create nodes operation
+      block:
+        - name: Validate bulk parameters
+          ansible.builtin.assert:
+            that:
+              - node_count is defined
+              - node_count | int > 0
+              - node_count | int <= (_available_slots | length)
+            fail_msg: |
+              Bulk operation requires:
+              - node_count parameter (number of nodes to create)
+              - Sufficient available slots
+              Requested: {{ node_count | default('undefined') }}
+              Available: {{ _available_slots | length }}
+            success_msg: "Bulk parameters validated"
+
+        - name: Select consecutive slots
+          ansible.builtin.set_fact:
+            _bulk_slots: "{{ _available_slots[:node_count | int] }}"
+
+        - name: Generate MAC addresses
+          ansible.builtin.set_fact:
+            _bulk_nodes: |
+              [
+              {% for slot in _bulk_slots %}
+                {
+                  "number": {{ slot }},
+                  "name": "{{ node_prefix }}{{ '%03d' | format(slot) }}",
+                  "fqdn": "{{ node_prefix }}{{ '%03d' | format(slot) }}.{{ domain }}",
+                  "mac": "{{ mac_address_prefix }}:{{ '%02x' | format(((ansible_date_time.epoch | int) + slot) % 256) if random_mac | bool else '%02x' | format(slot) }}"
+                }{{ ',' if not loop.last else '' }}
+              {% endfor %}
+              ]
+
+        - name: Parse bulk nodes list
+          ansible.builtin.set_fact:
+            _bulk_nodes_list: "{{ _bulk_nodes | from_json }}"
+
+        - name: Display bulk creation plan
+          ansible.builtin.debug:
+            msg: |
+              Bulk Creation Plan
+              ==================
+              Nodes to create: {{ node_count }}
+              MAC prefix: {{ mac_address_prefix }}
+              
+              Nodes:
+              {% for node in _bulk_nodes_list %}
+              {{ node.name }} - {{ node.mac }}
+              {% endfor %}
+
+        - name: Confirmation pause
+          ansible.builtin.pause:
+            seconds: "{{ confirmation_timeout }}"
+            prompt: "Creating {{ node_count }} nodes in {{ confirmation_timeout }} seconds (Ctrl+C to abort)"
+          when: require_confirmation | bool
+
+        - name: Create nodes in bulk
+          ansible.builtin.uri:
+            url: "https://{{ satellite_host }}/api/hosts"
+            method: POST
+            user: "{{ satellite_user }}"
+            password: "{{ satellite_password }}"
+            force_basic_auth: true
+            validate_certs: false
+            body_format: json
+            body:
+              host:
+                name: "{{ item.name }}"
+                mac: "{{ item.mac }}"
+                operatingsystem_id: "{{ os_id }}"
+                hostgroup_id: "{{ hostgroup_id }}"
+                subnet_id: "{{ subnet_id }}"
+                location_id: "{{ location_id }}"
+                organization_id: "{{ organization_id }}"
+                build: true
+                enabled: true
+                managed: true
+            status_code: 201
+          register: _bulk_create_results
+          loop: "{{ _bulk_nodes_list }}"
+          loop_control:
+            label: "{{ item.name }}"
+          retries: "{{ api_retry_count }}"
+          delay: "{{ api_retry_delay }}"
+          until: _bulk_create_results.status == 201
+          failed_when: false
+          no_log: true
+
+        - name: Count successful creations
+          ansible.builtin.set_fact:
+            _success_count: "{{ _bulk_create_results.results | selectattr('status', 'equalto', 201) | list | length }}"
+            _failed_count: "{{ _bulk_create_results.results | rejectattr('status', 'equalto', 201) | list | length }}"
+
+        - name: Display bulk creation summary
+          ansible.builtin.debug:
+            msg: |
+              Bulk Creation Summary
+              =====================
+              Total requested: {{ node_count }}
+              Successful: {{ _success_count }}
+              Failed: {{ _failed_count }}
+              
+              {% if _failed_count | int > 0 %}
+              Failed nodes:
+              {% for result in _bulk_create_results.results %}
+              {% if result.status != 201 %}
+              {{ result.item.name }}: {{ result.msg | default('Unknown error') }}
+              {% endif %}
+              {% endfor %}
+              {% endif %}
+
+        - name: Build bulk export rows
+          ansible.builtin.set_fact:
+            _export_rows: >-
+              {{ ['name,id,mac,slot,status'] + (_bulk_create_results.results | map(attribute='json') | list | select('defined') | map(attribute='name') | list) }}
+          when: export_path is defined
+          delegate_to: localhost
+          run_once: true
+          ignore_errors: true
+
+        - name: Prepare bulk export content
+          ansible.builtin.set_fact:
+            _bulk_export_content: |
+              name,id,mac,slot,timestamp,status
+              {% for r in _bulk_create_results.results %}
+              {{ r.item.name }},{{ (r.json.id if (r.status==201 and r.json is defined) else '') }},{{ r.item.mac }},{{ r.item.number }},{{ ansible_date_time.iso8601 }},{{ 'CREATED' if r.status==201 else 'FAILED' }}
+              {% endfor %}
+          when: export_path is defined
+          delegate_to: localhost
+          run_once: true
+
+        - name: Write bulk export CSV
+          ansible.builtin.copy:
+            dest: "{{ export_path }}"
+            content: "{{ _bulk_export_content }}\n"
+          when: export_path is defined
+          delegate_to: localhost
+          run_once: true
+      rescue:
+        - name: Display bulk error
+          ansible.builtin.debug:
+            msg: "Bulk creation encountered errors. Check logs for details."
+
+        - name: Fail with partial results
+          ansible.builtin.fail:
+            msg: "Bulk operation completed with {{ _failed_count | default('some') }} failures"
+      when: operation == 'bulk'
+      tags: bulk
+
+    # DELETE OPERATION
+    - name: Delete node operation
+      block:
+        - name: Validate delete parameters
+          ansible.builtin.assert:
+            that:
+              - node_number is defined or node_name is defined
+            fail_msg: |
+              Delete operation requires either:
+              - node_number parameter (e.g., -e node_number=42)
+              - node_name parameter (e.g., -e node_name=node042.prod.spg)
+            success_msg: "Delete parameters validated"
+
+        - name: Determine FQDN to delete
+          ansible.builtin.set_fact:
+            _delete_fqdn: "{{ node_name if node_name is defined else (node_prefix + '%03d' | format(node_number | int) + '.' + domain) }}"
+
+        - name: Find host in Satellite
+          ansible.builtin.uri:
+            url: "https://{{ satellite_host }}/api/hosts?search=name={{ _delete_fqdn }}"
+            method: GET
+            user: "{{ satellite_user }}"
+            password: "{{ satellite_password }}"
+            force_basic_auth: true
+            validate_certs: false
+            return_content: true
+            status_code: 200
+          register: _delete_search
+          no_log: true
+          changed_when: false
+
+        - name: Verify host exists
+          ansible.builtin.assert:
+            that:
+              - _delete_search.json.results | length > 0
+            fail_msg: "Host {{ _delete_fqdn }} not found in Satellite"
+            success_msg: "Host found: {{ _delete_fqdn }}"
+
+        - name: Extract host ID
+          ansible.builtin.set_fact:
+            _delete_host_id: "{{ _delete_search.json.results[0].id }}"
+            _delete_host_name: "{{ _delete_search.json.results[0].name }}"
+
+        - name: Display deletion plan
+          ansible.builtin.debug:
+            msg: |
+              Node Deletion Plan
+              ==================
+              Host: {{ _delete_host_name }}
+              ID: {{ _delete_host_id }}
+              This will permanently delete the host from Satellite
+
+        - name: Confirmation pause
+          ansible.builtin.pause:
+            seconds: "{{ confirmation_timeout }}"
+            prompt: "Deleting {{ _delete_host_name }} in {{ confirmation_timeout }} seconds (Ctrl+C to abort)"
+          when: require_confirmation | bool
+
+        - name: Delete host from Satellite
+          ansible.builtin.uri:
+            url: "https://{{ satellite_host }}/api/hosts/{{ _delete_host_id }}"
+            method: DELETE
+            user: "{{ satellite_user }}"
+            password: "{{ satellite_password }}"
+            force_basic_auth: true
+            validate_certs: false
+            status_code: 200
+          register: _delete_result
+          retries: "{{ api_retry_count }}"
+          delay: "{{ api_retry_delay }}"
+          until: _delete_result.status == 200
+          no_log: true
+
+        - name: Display deletion success
+          ansible.builtin.debug:
+            msg: |
+              Node Deleted Successfully
+              =========================
+              Host: {{ _delete_host_name }}
+              Slot now available for reuse
+      rescue:
+        - name: Display deletion error
+          ansible.builtin.debug:
+            msg: |
+              Node deletion failed
+              Error: {{ _delete_result.msg | default('Unknown error') }}
+              
+              Troubleshooting:
+              1. Verify host exists: hammer host list
+              2. Check Satellite logs: tail -f /var/log/foreman/production.log
+              3. Try manual deletion: hammer host delete --name {{ _delete_fqdn }}
+
+        - name: Fail with error details
+          ansible.builtin.fail:
+            msg: "Host deletion failed. See troubleshooting info above."
+      when: operation == 'delete'
+      tags: delete

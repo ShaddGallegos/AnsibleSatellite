@@ -1,0 +1,364 @@
+---
+# Post-Installation Node Configuration
+# Synopsis: Finalizes freshly provisioned nodes: admin user creation, Satellite registration via activation keys, SSH adjustments, firewall enabling, optional tooling and service checks.
+# Runs on freshly installed nodes to complete setup
+# Enhanced with error handling and fallback options
+#
+# USAGE:
+#   ansible-playbook satellite_node_post_install.yml
+#   ansible-playbook satellite_node_post_install.yml --limit node001.prod.spg
+
+- name: Post-installation node configuration
+  hosts: all
+  become: true
+  gather_facts: true
+  
+  vars:
+    # Admin user configuration
+    admin_user: "{{ admin_user | default('admin') }}"
+    admin_password: "{{ admin_password | default('r3dh4t7!') }}"
+    force_password_change: "{{ force_password_change | default(true) }}"
+    
+    # Satellite configuration
+    satellite_ip: "{{ satellite_ip | default('10.168.151.127') }}"
+    satellite_fqdn: "{{ satellite_fqdn | default('satellite.prod.spg') }}"
+    
+    # Registration settings
+    activation_keys:
+      "7": "RHEL7-AK"
+      "8": "RHEL8-AK"
+      "9": "RHEL9-AK"
+    
+    # SSH configuration
+    enable_root_login: "{{ enable_root_login | default(true) }}"
+    disable_strict_host_checking: "{{ disable_strict_host_checking | default(true) }}"
+    
+    # Firewall services to enable
+    firewall_services:
+      - ssh
+      - http
+      - https
+    
+    # Optional services (only if available)
+    optional_services:
+      - rhc
+      - insights-client
+
+  pre_tasks:
+    - name: Wait for system to be fully booted
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+        delay: 10
+      register: _wait_boot
+      retries: 3
+      delay: 10
+      until: _wait_boot is succeeded
+      failed_when: false
+
+    - name: Check if system is reachable
+      ansible.builtin.ping:
+      register: _ping_test
+      failed_when: false
+
+    - name: Display connectivity status
+      ansible.builtin.debug:
+        msg: "System {{ inventory_hostname }} is {{ 'reachable' if _ping_test is succeeded else 'NOT reachable' }}"
+
+    - name: Fail if system unreachable
+      ansible.builtin.fail:
+        msg: |
+          Cannot connect to {{ inventory_hostname }}
+          
+          Troubleshooting:
+          1. Verify OS installation completed
+          2. Check network connectivity: ping {{ inventory_hostname }}
+          3. Verify SSH is running: systemctl status sshd
+          4. Check firewall: firewall-cmd --list-services
+      when: _ping_test is failed
+
+    - name: Gather minimal facts if full gather failed
+      ansible.builtin.setup:
+        gather_subset:
+          - min
+      when: ansible_os_family is not defined
+      register: _minimal_facts
+      failed_when: false
+
+    - name: Display OS information
+      ansible.builtin.debug:
+        msg: |
+          System Information
+          ==================
+          Hostname: {{ ansible_hostname }}
+          OS Family: {{ ansible_os_family | default('Unknown') }}
+          OS Version: {{ ansible_distribution }} {{ ansible_distribution_version | default('') }}
+          Kernel: {{ ansible_kernel | default('Unknown') }}
+
+  tasks:
+    # ADMIN USER CONFIGURATION
+    - name: Configure admin user
+      block:
+        - name: Check if admin user exists
+          ansible.builtin.getent:
+            database: passwd
+            key: "{{ admin_user }}"
+          register: _admin_check
+          failed_when: false
+
+        - name: Create admin user
+          ansible.builtin.user:
+            name: "{{ admin_user }}"
+            password: "{{ admin_password | password_hash('sha512') }}"
+            groups: wheel
+            append: true
+            shell: /bin/bash
+            update_password: on_create
+            state: present
+          register: _admin_create
+          when: _admin_check is failed
+
+        - name: Update admin password if user exists
+          ansible.builtin.user:
+            name: "{{ admin_user }}"
+            password: "{{ admin_password | password_hash('sha512') }}"
+            update_password: always
+          when: _admin_check is succeeded
+          no_log: true
+
+        - name: Force password change on first login
+          ansible.builtin.command:
+            cmd: "chage -d 0 {{ admin_user }}"
+          when: force_password_change | bool
+          changed_when: true
+
+        - name: Add admin to sudoers
+          ansible.builtin.lineinfile:
+            path: /etc/sudoers
+            state: present
+            regexp: "^{{ admin_user }}"
+            line: "{{ admin_user }} ALL=(ALL) NOPASSWD: ALL"
+            validate: '/usr/sbin/visudo -cf %s'
+          register: _sudoers_result
+          failed_when: false
+
+        - name: Warn if sudoers update failed
+          ansible.builtin.debug:
+            msg: "WARNING: Could not update sudoers file. Admin may not have sudo access."
+          when: _sudoers_result is failed
+
+        - name: Generate SSH key for admin
+          become_user: "{{ admin_user }}"
+          ansible.builtin.command:
+            cmd: ssh-keygen -t rsa -b 4096 -N "" -f ~/.ssh/id_rsa -C "{{ admin_user }}@{{ inventory_hostname }}"
+          args:
+            creates: "/home/{{ admin_user }}/.ssh/id_rsa"
+          register: _ssh_keygen
+          failed_when: false
+
+        - name: Display admin user status
+          ansible.builtin.debug:
+            msg: |
+              Admin User Configuration
+              ========================
+              User: {{ admin_user }}
+              {{ 'Created' if _admin_create is changed else 'Already exists' }}
+              Password change required: {{ force_password_change }}
+              SSH key: {{ 'Generated' if _ssh_keygen is changed else 'Already exists' }}
+      tags: admin_user
+
+    # SSH CONFIGURATION
+    - name: Configure SSH settings
+      block:
+        - name: Disable strict host key checking
+          ansible.builtin.lineinfile:
+            path: /etc/ssh/ssh_config
+            regexp: '^\s*StrictHostKeyChecking'
+            line: '    StrictHostKeyChecking no'
+            insertafter: '^Host \*'
+          when: disable_strict_host_checking | bool
+          register: _ssh_config
+
+        - name: Enable root login
+          ansible.builtin.lineinfile:
+            path: /etc/ssh/sshd_config
+            regexp: '^\s*PermitRootLogin'
+            line: 'PermitRootLogin yes'
+          when: enable_root_login | bool
+          register: _sshd_config
+
+        - name: Restart SSH daemon if config changed
+          ansible.builtin.service:
+            name: sshd
+            state: restarted
+          when: _ssh_config is changed or _sshd_config is changed
+      tags: ssh_config
+
+    # HOSTNAME CONFIGURATION
+    - name: Configure hostname
+      block:
+        - name: Set hostname to inventory name
+          ansible.builtin.hostname:
+            name: "{{ inventory_hostname_short }}"
+          when: ansible_hostname != inventory_hostname_short
+          register: _hostname_change
+
+        - name: Update hosts file
+          ansible.builtin.lineinfile:
+            path: /etc/hosts
+            regexp: "^127.0.1.1"
+            line: "127.0.1.1 {{ inventory_hostname }} {{ inventory_hostname_short }}"
+          register: _hosts_update
+          failed_when: false
+
+        - name: Display hostname status
+          ansible.builtin.debug:
+            msg: "Hostname: {{ ansible_hostname }} {{ '(updated)' if _hostname_change is changed else '(unchanged)' }}"
+      tags: hostname
+
+    # SATELLITE REGISTRATION
+    - name: Register to Satellite
+      block:
+        - name: Check if already registered
+          ansible.builtin.command:
+            cmd: subscription-manager identity
+          register: _reg_check
+          changed_when: false
+          failed_when: false
+
+        - name: Display registration status
+          ansible.builtin.debug:
+            msg: "System {{ 'already registered' if _reg_check.rc == 0 else 'not registered' }} to Satellite"
+
+        - name: Install Satellite CA certificate
+          ansible.builtin.yum:
+            name: "http://{{ satellite_ip }}/pub/katello-ca-consumer-{{ satellite_fqdn }}-1.0-1.noarch.rpm"
+            state: present
+            disable_gpg_check: true
+          when: _reg_check.rc != 0
+          register: _ca_install
+          failed_when: false
+
+        - name: Determine activation key from OS version
+          ansible.builtin.set_fact:
+            _activation_key: "{{ activation_keys[ansible_distribution_major_version | string] | default('') }}"
+          when: _reg_check.rc != 0
+
+        - name: Register with Satellite using activation key
+          ansible.builtin.command:
+            cmd: "subscription-manager register --org=Default_Organization --activationkey={{ _activation_key }}"
+          when:
+            - _reg_check.rc != 0
+            - _activation_key | length > 0
+          register: _registration
+          failed_when: false
+          changed_when: "'successfully registered' in _registration.stdout | lower"
+
+        - name: Warn if registration failed
+          ansible.builtin.debug:
+            msg: |
+              WARNING: Satellite registration failed or skipped
+              Reason: {{ _registration.msg | default('No activation key for OS version ' + ansible_distribution_major_version) }}
+              Manual registration may be required
+          when: _reg_check.rc != 0 and (_registration is failed or _activation_key | length == 0)
+
+        - name: Enable Satellite tools repository
+          community.general.rhsm_repository:
+            name: "satellite-client-6-for-rhel-{{ ansible_distribution_major_version }}-x86_64-rpms"
+            state: enabled
+          when: _reg_check.rc == 0 or _registration is succeeded
+          register: _repo_enable
+          failed_when: false
+
+        - name: Install katello-agent
+          ansible.builtin.yum:
+            name: katello-agent
+            state: present
+          when: _reg_check.rc == 0 or _registration is succeeded
+          register: _agent_install
+          failed_when: false
+
+        - name: Display registration summary
+          ansible.builtin.debug:
+            msg: |
+              Satellite Registration
+              ======================
+              Status: {{ 'Registered' if (_reg_check.rc == 0 or _registration is succeeded) else 'Not registered' }}
+              Activation key: {{ _activation_key | default('N/A') }}
+              CA certificate: {{ 'Installed' if _ca_install is changed else 'Already present' if _ca_install is skipped else 'Failed' }}
+              Katello agent: {{ 'Installed' if _agent_install is changed else 'Already present' if _agent_install is skipped else 'Not installed' }}
+      tags: satellite_registration
+
+    # FIREWALL CONFIGURATION
+    - name: Configure firewall
+      block:
+        - name: Check if firewalld is available
+          ansible.builtin.systemd:
+            name: firewalld
+          register: _firewalld_check
+          failed_when: false
+
+        - name: Enable required firewall services
+          ansible.posix.firewalld:
+            service: "{{ item }}"
+            permanent: true
+            state: enabled
+            immediate: true
+          loop: "{{ firewall_services }}"
+          when: _firewalld_check.status.LoadState == "loaded"
+          register: _firewall_required
+          failed_when: false
+
+        - name: Enable optional firewall services
+          ansible.posix.firewalld:
+            service: "{{ item }}"
+            permanent: true
+            state: enabled
+            immediate: true
+          loop: "{{ optional_services }}"
+          when: _firewalld_check.status.LoadState == "loaded"
+          register: _firewall_optional
+          failed_when: false
+
+        - name: Display firewall status
+          ansible.builtin.debug:
+            msg: |
+              Firewall Configuration
+              ======================
+              Firewalld: {{ 'Running' if _firewalld_check.status.LoadState == 'loaded' else 'Not available' }}
+              Services enabled: {{ firewall_services | join(', ') }}
+      tags: firewall
+
+    # SYSTEM UPDATES
+    - name: System updates
+      block:
+        - name: Update all packages
+          ansible.builtin.yum:
+            name: '*'
+            state: latest
+          when: perform_system_update | default(false) | bool
+          register: _system_update
+          async: 3600
+          poll: 30
+
+        - name: Display update status
+          ansible.builtin.debug:
+            msg: "System updates: {{ 'Completed' if _system_update is changed else 'Skipped (set perform_system_update=true to enable)' }}"
+      tags: system_update
+
+  post_tasks:
+    - name: Final configuration summary
+      ansible.builtin.debug:
+        msg: |
+          Post-Installation Summary
+          =========================
+          Hostname: {{ ansible_hostname }}
+          Admin user: {{ admin_user }} ({{ 'created' if _admin_create is changed else 'exists' }})
+          SSH configured: {{ 'Yes' if (_ssh_config is changed or _sshd_config is changed) else 'No changes needed' }}
+          Satellite registration: {{ 'Success' if (_reg_check.rc == 0 or _registration is succeeded) else 'Failed/Skipped' }}
+          Firewall: {{ 'Configured' if (_firewall_required is changed or _firewall_optional is changed) else 'No changes needed' }}
+          
+          Next Steps:
+          1. Login as {{ admin_user }} and change password
+          2. Verify Satellite registration: subscription-manager identity
+          3. Check services: systemctl status sshd firewalld
+      tags: always

@@ -1,0 +1,64 @@
+---
+# Verify that /root/post-install-summary.txt exists on a freshly provisioned host
+# Synopsis: Confirms successful kickstart %post execution by waiting for SSH and inspecting the post-install summary file contents.
+# This does not provision the host; it only checks the result.
+#
+# Usage:
+#   ansible-playbook verify_post_install_summary.yml \
+#     -e target_host=your.new.host.example.com \
+#     -e ssh_user=root \
+#     -e ansible_ssh_private_key_file=~/.ssh/id_rsa
+
+- name: Register dynamic host for verification
+  hosts: localhost
+  gather_facts: false
+  vars:
+    target_host: "{{ target_host | default(omit) }}"
+    ssh_user: "{{ ssh_user | default('root') }}"
+    ansible_ssh_private_key_file: "{{ ansible_ssh_private_key_file | default(omit) }}"
+    ansible_password: "{{ ansible_password | default(omit) }}"
+  tasks:
+    - name: Ensure target_host is provided
+      ansible.builtin.assert:
+        that:
+          - target_host is defined
+        fail_msg: "You must provide -e target_host=<FQDN_or_IP>"
+
+    - name: Add new host to inventory for this run
+      ansible.builtin.add_host:
+        name: newnode
+        ansible_host: "{{ target_host }}"
+        ansible_user: "{{ ssh_user }}"
+        ansible_ssh_private_key_file: "{{ ansible_ssh_private_key_file | default(omit) }}"
+        ansible_password: "{{ ansible_password | default(omit) }}"
+
+- name: Wait for SSH and verify summary file
+  hosts: newnode
+  gather_facts: false
+  tasks:
+    - name: Wait for SSH to become available
+      ansible.builtin.wait_for:
+        host: "{{ ansible_host }}"
+        port: 22
+        state: started
+        delay: 5
+        timeout: 900
+
+    - name: Check for /root/post-install-summary.txt
+      ansible.builtin.stat:
+        path: /root/post-install-summary.txt
+      register: summary_stat
+
+    - name: Fail if summary file is missing
+      ansible.builtin.fail:
+        msg: "post-install summary not found at /root/post-install-summary.txt"
+      when: not summary_stat.stat.exists
+
+    - name: Display a snippet of the summary for confirmation
+      ansible.builtin.shell: "head -n 50 /root/post-install-summary.txt || tail -n 50 /root/post-install-summary.txt"
+      register: summary_snippet
+      changed: false
+
+    - name: Summary output
+      ansible.builtin.debug:
+        msg: "\n{{ summary_snippet.stdout }}"

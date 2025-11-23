@@ -1,0 +1,159 @@
+---
+# Push or update a Foreman/Satellite provisioning template via API
+# Synopsis: Reads local ERB and idempotently creates or updates the provisioning template via Satellite API, associating it with the RHEL 9 OS family.
+# Translates the ERB created from post-install Ansible tasks into a managed template.
+# Idempotent: will create if absent, update if present.
+#
+# USAGE:
+#   SATELLITE_PASSWORD='r3dh4t7!' ansible-playbook push_provisioning_template.yml \
+#     -e satellite_username=admin
+#
+# Recommended: DO NOT hardcode password; use env var or Ansible Vault.
+# Variables:
+#   satellite_url: Base URL to Satellite
+#   satellite_username / satellite_password: API credentials (basic auth)
+#   template_name: Name of provisioning template
+#   template_file: Path to ERB template content
+#   template_kind: provision | finish | user_data etc (here: provision)
+#
+# Requires: community.general collection only if extended auth used (not here).
+
+- name: Manage Foreman provisioning template
+  hosts: localhost
+  gather_facts: false
+  connection: local
+
+  vars:
+    satellite_url: "https://satellite.prod.spg"
+    satellite_username: "{{ satellite_username | default('admin') }}"
+    # Prefer environment variable SATELLITE_PASSWORD if not passed explicitly
+    satellite_password: "{{ satellite_password | default(lookup('env','SATELLITE_PASSWORD')) }}"
+    template_name: "RHEL 9.7 x86_64 Post-Kickstart Default"
+    template_file: "AnsibleSatellite/playbooks/node_provisioning/templates/RHEL_9.7_x86_64_post_kickstart_default.erb"
+    template_kind: "provision"
+    audit_comment: "Managed via automation push_provisioning_template.yml"
+
+  tasks:
+    - name: Fail fast if password not provided
+      ansible.builtin.fail:
+        msg: "satellite_password not supplied (set SATELLITE_PASSWORD env var or -e satellite_password=...)"
+      when: satellite_password | default('') | length == 0
+
+    - name: Read template content from file
+      ansible.builtin.set_fact:
+        _template_content: "{{ lookup('file', template_file) }}"
+      vars:
+        ansible_become: false
+
+    - name: Query Operating Systems list
+      ansible.builtin.uri:
+        url: "{{ satellite_url }}/api/v2/operatingsystems"
+        method: GET
+        user: "{{ satellite_username }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: 200
+      register: _operatingsystems
+      no_log: true
+
+    - name: Determine RHEL 9 OS id
+      ansible.builtin.set_fact:
+        _os_id: "{{ (_operatingsystems.json.results | selectattr('name','search','Red') | selectattr('major','equalto',9) | map(attribute='id') | list | first) | default(None) }}"
+
+    - name: Fail if RHEL 9 OS id not found
+      ansible.builtin.fail:
+        msg: "Could not determine RHEL 9 operating system ID from Satellite API"
+      when: _os_id is not defined or _os_id is none
+
+    - name: Search existing provisioning template by name
+      ansible.builtin.uri:
+        url: "{{ satellite_url }}/api/v2/provisioning_templates?search=name=\"{{ template_name | urlencode }}\""
+        method: GET
+        user: "{{ satellite_username }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: 200
+      register: _template_search
+      no_log: true
+
+    - name: Extract existing template id (if any)
+      ansible.builtin.set_fact:
+        _existing_template_id: "{{ (_template_search.json.results | selectattr('name','equalto',template_name) | map(attribute='id') | list | first) | default(None) }}"
+
+    - name: Decide action (create vs update)
+      ansible.builtin.set_fact:
+        _action: "{{ 'create' if _existing_template_id is none else 'update' }}"
+
+    - name: Create provisioning template
+      ansible.builtin.uri:
+        url: "{{ satellite_url }}/api/v2/provisioning_templates"
+        method: POST
+        user: "{{ satellite_username }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: [201]
+        body_format: json
+        body:
+          provisioning_template:
+            name: "{{ template_name }}"
+            template: "{{ _template_content }}"
+            kind: "{{ template_kind }}"
+            snippet: false
+            audit_comment: "{{ audit_comment }}"
+            locked: false
+            operatingsystem_ids: [ "{{ _os_id }}" ]
+        timeout: 60
+      register: _create_result
+      when: _action == 'create'
+      no_log: true
+
+    - name: Update provisioning template
+      ansible.builtin.uri:
+        url: "{{ satellite_url }}/api/v2/provisioning_templates/{{ _existing_template_id }}"
+        method: PUT
+        user: "{{ satellite_username }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: [200]
+        body_format: json
+        body:
+          provisioning_template:
+            name: "{{ template_name }}"
+            template: "{{ _template_content }}"
+            kind: "{{ template_kind }}"
+            audit_comment: "{{ audit_comment }}"
+            locked: false
+            operatingsystem_ids: [ "{{ _os_id }}" ]
+        timeout: 60
+      register: _update_result
+      when: _action == 'update'
+      no_log: true
+
+    - name: Display result summary
+      ansible.builtin.debug:
+        msg: |
+          Provisioning template '{{ template_name }}' {{ 'created' if _action == 'create' else 'updated' }} successfully.
+          OS ID: {{ _os_id }}
+          Action: {{ _action }}
+          Existing ID: {{ _existing_template_id | default('N/A') }}
+          API Endpoint: {{ satellite_url }}/api/v2/provisioning_templates
+
+    - name: Guidance for curl usage (manual alternative)
+      ansible.builtin.debug:
+        msg: |
+          Manual curl examples (DO NOT paste password in history - prefer env var):
+          export SATPW='(password)'
+          # Search existing
+          curl -k -u admin:"$SATPW" "{{ satellite_url }}/api/v2/provisioning_templates?search=name=\"{{ template_name }}\""
+          # Create
+          curl -k -u admin:"$SATPW" -H 'Content-Type: application/json' -X POST \
+            -d '{"provisioning_template":{"name":"{{ template_name }}","template":"(escape ERB content)","kind":"{{ template_kind }}","locked":false,"operatingsystem_ids":[{{ _os_id }}]}}' \
+            {{ satellite_url }}/api/v2/provisioning_templates
+          # Update (replace ID)
+          curl -k -u admin:"$SATPW" -H 'Content-Type: application/json' -X PUT \
+            -d '{"provisioning_template":{"template":"(escape ERB content)","operatingsystem_ids":[{{ _os_id }}]}}' \
+            {{ satellite_url }}/api/v2/provisioning_templates/{{ _existing_template_id | default('<ID>') }}

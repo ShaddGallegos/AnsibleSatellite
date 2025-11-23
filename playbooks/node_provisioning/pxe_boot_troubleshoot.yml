@@ -1,0 +1,461 @@
+---
+# PXE Boot Troubleshooting and Remediation
+# Synopsis: Performs comprehensive PXE boot diagnostics (VM state, firmware, TFTP, PXE templates, kernel options, repo reachability) and applies remediation steps.
+# Comprehensive PXE boot diagnostics and automatic fixes
+# Enhanced with error handling, retries, and fallback options
+#
+# USAGE:
+#   ansible-playbook pxe_boot_troubleshoot.yml \
+#     -e host_name=node001.prod.spg \
+#     -e vm_name=node001 \
+#     -e kvm_uri=qemu:///system
+
+- name: Gather VM information from KVM host
+  hosts: kvm
+  become: false
+  gather_facts: false
+  
+  vars:
+    kvm_uri: "{{ kvm_uri | default('qemu:///system') }}"
+    
+  pre_tasks:
+    - name: Validate required parameters
+      ansible.builtin.assert:
+        that:
+          - vm_name is defined
+          - vm_name | length > 0
+        fail_msg: "vm_name parameter is required. Usage: -e vm_name=<vm_name>"
+        success_msg: "Parameters validated"
+
+    - name: Check virsh availability
+      ansible.builtin.command:
+        cmd: which virsh
+      register: _virsh_check
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if virsh not available
+      ansible.builtin.fail:
+        msg: |
+          virsh command not found on {{ inventory_hostname }}
+          
+          Install libvirt client:
+          - RHEL/CentOS: yum install libvirt-client
+          - Ubuntu/Debian: apt install libvirt-clients
+      when: _virsh_check.rc != 0
+
+  tasks:
+    - name: List all VMs to find exact name
+      ansible.builtin.command:
+        cmd: "virsh -c {{ kvm_uri }} list --all"
+      register: _vm_list
+      changed_when: false
+      failed_when: false
+
+    - name: Display available VMs
+      ansible.builtin.debug:
+        msg: "{{ _vm_list.stdout_lines }}"
+      when: _vm_list.rc == 0
+
+    - name: Try to get VM domain info
+      ansible.builtin.command:
+        cmd: "virsh -c {{ kvm_uri }} dominfo {{ vm_name }}"
+      register: _vm_info
+      changed_when: false
+      failed_when: false
+
+    - name: Search for similar VM names if exact match failed
+      ansible.builtin.shell:
+        cmd: "virsh -c {{ kvm_uri }} list --all | awk 'NR>2 {print $2}' | grep -i '{{ vm_name }}' | head -1"
+      register: _vm_search
+      changed_when: false
+      when: _vm_info.rc != 0
+
+    - name: Use found VM name if different
+      ansible.builtin.set_fact:
+        vm_name: "{{ _vm_search.stdout }}"
+      when:
+        - _vm_info.rc != 0
+        - _vm_search.stdout | length > 0
+
+    - name: Fail if VM not found
+      ansible.builtin.fail:
+        msg: |
+          VM '{{ vm_name }}' not found
+          
+          Available VMs:
+          {{ _vm_list.stdout_lines | join('\n') }}
+          
+          Troubleshooting:
+          1. Check VM name: virsh -c {{ kvm_uri }} list --all
+          2. Verify KVM URI: {{ kvm_uri }}
+          3. Check libvirt permissions: virsh -c {{ kvm_uri }} version
+      when:
+        - _vm_info.rc != 0
+        - _vm_search.stdout | default('') | length == 0
+
+    - name: Get VM network interfaces
+      ansible.builtin.command:
+        cmd: "virsh -c {{ kvm_uri }} domiflist {{ vm_name }}"
+      register: _vm_interfaces
+      changed_when: false
+
+    - name: Extract MAC address
+      ansible.builtin.shell:
+        cmd: "virsh -c {{ kvm_uri }} domiflist {{ vm_name }} | awk 'NR>2 && NF>=5 {print $5; exit}' | tr '[:upper:]' '[:lower:]'"
+      register: _vm_mac
+      changed_when: false
+
+    - name: Get VM XML configuration
+      ansible.builtin.command:
+        cmd: "virsh -c {{ kvm_uri }} dumpxml {{ vm_name }}"
+      register: _vm_xml
+      changed_when: false
+
+    - name: Determine firmware type
+      ansible.builtin.set_fact:
+        firmware_type: "{{ 'uefi' if '<loader' in _vm_xml.stdout else 'bios' }}"
+
+    - name: Fallback MAC extraction from XML
+      ansible.builtin.set_fact:
+        _vm_mac_xml: "{{ _vm_xml.stdout | regex_search('mac address=\"([^\"]+)\"', '\\1') | first | default('') }}"
+      when: _vm_mac.stdout | trim | length == 0
+
+    - name: Set effective MAC address
+      ansible.builtin.set_fact:
+        vm_mac_address: "{{ _vm_mac.stdout | trim if _vm_mac.stdout | trim | length > 0 else _vm_mac_xml }}"
+
+    - name: Compute PXE MAC label
+      ansible.builtin.set_fact:
+        vm_mac_label: "01-{{ vm_mac_address | lower | regex_replace(':', '-') }}"
+
+    - name: Display VM discovery summary
+      ansible.builtin.debug:
+        msg: |
+          VM Discovery Results
+          ====================
+          VM name: {{ vm_name }}
+          KVM URI: {{ kvm_uri }}
+          MAC address: {{ vm_mac_address }}
+          PXE label: {{ vm_mac_label }}
+          Firmware: {{ firmware_type }}
+          
+          Interface details:
+          {{ _vm_interfaces.stdout_lines | join('\n') }}
+
+- name: Remediate PXE configuration on Satellite
+  hosts: satellite
+  become: true
+  gather_facts: false
+  
+  vars:
+    sat_tftp_root: "/var/lib/tftpboot"
+    sat_boot_dir: "{{ sat_tftp_root }}/boot"
+    
+    firmware_type: "{{ hostvars[groups['kvm'][0]]['firmware_type'] }}"
+    vm_mac_label: "{{ hostvars[groups['kvm'][0]]['vm_mac_label'] }}"
+    vm_mac_address: "{{ hostvars[groups['kvm'][0]]['vm_mac_address'] }}"
+    
+    pxe_loader_bios: "PXELinux BIOS"
+    pxe_loader_uefi: "Grub2 UEFI"
+    
+    api_retry_count: 3
+    api_retry_delay: 5
+  
+  pre_tasks:
+    - name: Validate host_name parameter
+      ansible.builtin.assert:
+        that:
+          - host_name is defined
+          - host_name | length > 0
+        fail_msg: "host_name parameter is required. Usage: -e host_name=node001.prod.spg"
+        success_msg: "host_name validated: {{ host_name }}"
+
+    - name: Check hammer availability
+      ansible.builtin.command:
+        cmd: which hammer
+      register: _hammer_check
+      changed_when: false
+      failed_when: false
+
+    - name: Warn if hammer not available
+      ansible.builtin.debug:
+        msg: "WARNING: hammer CLI not found. Some operations may fail."
+      when: _hammer_check.rc != 0
+
+  tasks:
+    - name: Get Satellite API credentials
+      ansible.builtin.set_fact:
+        _sat_user: "{{ satellite_user | default('admin') }}"
+        _sat_password: "{{ satellite_password | default(lookup('env', 'SATELLITE_PASSWORD')) }}"
+
+    - name: Verify Satellite credentials
+      ansible.builtin.assert:
+        that:
+          - _sat_password | length > 0
+        fail_msg: "Satellite password required. Set via -e satellite_password=PASSWORD or export SATELLITE_PASSWORD=password"
+        success_msg: "Satellite credentials present"
+      no_log: true
+
+    - name: Search for host in Satellite
+      ansible.builtin.uri:
+        url: "https://{{ inventory_hostname }}/api/hosts?search=name={{ host_name }}"
+        method: GET
+        user: "{{ _sat_user }}"
+        password: "{{ _sat_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        return_content: true
+        status_code: 200
+      register: _host_search
+      retries: "{{ api_retry_count }}"
+      delay: "{{ api_retry_delay }}"
+      until: _host_search.status == 200
+      no_log: true
+      changed_when: false
+
+    - name: Verify host exists
+      ansible.builtin.assert:
+        that:
+          - _host_search.json.results | length > 0
+        fail_msg: |
+          Host {{ host_name }} not found in Satellite
+          
+          Check available hosts:
+          hammer host list --search "name ~ {{ host_name.split('.')[0] }}"
+        success_msg: "Host found in Satellite"
+
+    - name: Extract host information
+      ansible.builtin.set_fact:
+        _host_id: "{{ _host_search.json.results[0].id }}"
+        _host_name: "{{ _host_search.json.results[0].name }}"
+        _host_ip: "{{ _host_search.json.results[0].ip | default('N/A') }}"
+        _host_mac: "{{ _host_search.json.results[0].mac | default('N/A') }}"
+
+    - name: Display host information
+      ansible.builtin.debug:
+        msg: |
+          Satellite Host Information
+          ==========================
+          Name: {{ _host_name }}
+          ID: {{ _host_id }}
+          IP: {{ _host_ip }}
+          MAC (Satellite): {{ _host_mac }}
+          MAC (VM): {{ vm_mac_address }}
+
+    - name: Check if MAC addresses match
+      ansible.builtin.debug:
+        msg: "WARNING: MAC address mismatch between Satellite ({{ _host_mac }}) and VM ({{ vm_mac_address }})"
+      when: _host_mac != vm_mac_address and _host_mac != 'N/A'
+
+    - name: Determine appropriate PXE loader
+      ansible.builtin.set_fact:
+        _pxe_loader: "{{ pxe_loader_uefi if firmware_type == 'uefi' else pxe_loader_bios }}"
+
+    - name: Update host PXE loader
+      ansible.builtin.uri:
+        url: "https://{{ inventory_hostname }}/api/hosts/{{ _host_id }}"
+        method: PUT
+        user: "{{ _sat_user }}"
+        password: "{{ _sat_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: json
+        body:
+          host:
+            pxe_loader: "{{ _pxe_loader }}"
+        status_code: 200
+      register: _loader_update
+      retries: "{{ api_retry_count }}"
+      delay: "{{ api_retry_delay }}"
+      until: _loader_update.status == 200
+      no_log: true
+
+    - name: Enable build mode
+      ansible.builtin.uri:
+        url: "https://{{ inventory_hostname }}/api/hosts/{{ _host_id }}"
+        method: PUT
+        user: "{{ _sat_user }}"
+        password: "{{ _sat_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: json
+        body:
+          host:
+            build: true
+        status_code: 200
+      register: _build_enable
+      retries: "{{ api_retry_count }}"
+      delay: "{{ api_retry_delay }}"
+      until: _build_enable.status == 200
+      no_log: true
+
+    - name: Determine PXE config path
+      ansible.builtin.set_fact:
+        _pxe_config_path: "{{ sat_tftp_root + '/grub2/grub.cfg-' + vm_mac_label if firmware_type == 'uefi' else sat_tftp_root + '/pxelinux.cfg/' + vm_mac_label }}"
+
+    - name: Check if PXE config exists
+      ansible.builtin.stat:
+        path: "{{ _pxe_config_path }}"
+      register: _pxe_config_stat
+
+    - name: Display PXE config status
+      ansible.builtin.debug:
+        msg: |
+          PXE Configuration
+          =================
+          Firmware: {{ firmware_type }}
+          PXE loader: {{ _pxe_loader }}
+          Config path: {{ _pxe_config_path }}
+          Config exists: {{ _pxe_config_stat.stat.exists }}
+
+    - name: Read PXE config if exists
+      ansible.builtin.slurp:
+        src: "{{ _pxe_config_path }}"
+      register: _pxe_config_content
+      when: _pxe_config_stat.stat.exists
+
+    - name: Parse PXE config
+      ansible.builtin.set_fact:
+        _pxe_config_text: "{{ _pxe_config_content.content | b64decode }}"
+      when: _pxe_config_stat.stat.exists
+
+    - name: Extract kernel and initrd from config
+      ansible.builtin.set_fact:
+        _kernel_line: "{{ _pxe_config_text | regex_search('(linux|kernel)\\s+([^\\s]+)', '\\2') | first | default('') }}"
+        _initrd_line: "{{ _pxe_config_text | regex_search('(initrd|initrdefi)\\s+([^\\s]+)', '\\2') | first | default('') }}"
+      when: _pxe_config_stat.stat.exists
+
+    - name: Check if boot files exist
+      ansible.builtin.stat:
+        path: "{{ sat_tftp_root }}/{{ item }}"
+      register: _boot_files_check
+      loop:
+        - "{{ _kernel_line }}"
+        - "{{ _initrd_line }}"
+      when:
+        - _pxe_config_stat.stat.exists
+        - item | length > 0
+
+    - name: Search for actual boot files
+      ansible.builtin.find:
+        paths: "{{ sat_boot_dir }}"
+        patterns:
+          - "vmlinuz*"
+          - "initrd*"
+        recurse: true
+      register: _boot_files_found
+      when: _pxe_config_stat.stat.exists
+
+    - name: Display boot file analysis
+      ansible.builtin.debug:
+        msg: |
+          Boot File Analysis
+          ==================
+          Expected kernel: {{ _kernel_line | default('Not found in config') }}
+          Expected initrd: {{ _initrd_line | default('Not found in config') }}
+          
+          Available boot files:
+          {% for file in _boot_files_found.files | default([]) %}
+          {{ file.path }}
+          {% endfor %}
+      when: _pxe_config_stat.stat.exists
+
+    - name: Verify inst.stage2 in PXE config
+      ansible.builtin.set_fact:
+        _has_stage2: "{{ 'inst.stage2' in _pxe_config_text }}"
+      when: _pxe_config_stat.stat.exists
+
+    - name: Display inst.stage2 status
+      ansible.builtin.debug:
+        msg: "inst.stage2 parameter: {{ 'PRESENT' if _has_stage2 | default(false) else 'MISSING - This may cause boot failures' }}"
+      when: _pxe_config_stat.stat.exists
+
+    - name: Extract inst.stage2 URL
+      ansible.builtin.set_fact:
+        _stage2_url: "{{ _pxe_config_text | regex_search('inst\\.stage2=([^\\s]+)', '\\1') | first | default('') }}"
+      when:
+        - _pxe_config_stat.stat.exists
+        - _has_stage2 | default(false)
+
+    - name: Test inst.stage2 URL reachability
+      ansible.builtin.uri:
+        url: "{{ _stage2_url }}"
+        method: HEAD
+        status_code: [200, 301, 302]
+      register: _stage2_test
+      when:
+        - _pxe_config_stat.stat.exists
+        - _has_stage2 | default(false)
+        - _stage2_url | length > 0
+      failed_when: false
+      changed_when: false
+
+    - name: Display inst.stage2 test results
+      ansible.builtin.debug:
+        msg: |
+          inst.stage2 URL: {{ _stage2_url | default('N/A') }}
+          Reachability: {{ 'OK' if _stage2_test is succeeded else 'FAILED - URL not accessible' }}
+      when:
+        - _pxe_config_stat.stat.exists
+        - _has_stage2 | default(false)
+
+    - name: Create remediation summary
+      ansible.builtin.debug:
+        msg: |
+          PXE Remediation Summary
+          =======================
+          Host: {{ _host_name }}
+          Firmware: {{ firmware_type }}
+          PXE Loader: {{ _pxe_loader }} {{ '(updated)' if _loader_update is changed else '(already set)' }}
+          Build mode: {{ 'Enabled' if _build_enable is changed else 'Already enabled' }}
+          PXE config: {{ 'Exists' if _pxe_config_stat.stat.exists else 'NOT FOUND - May regenerate on next boot' }}
+          inst.stage2: {{ 'Present and reachable' if (_has_stage2 | default(false) and _stage2_test is succeeded) else 'Missing or unreachable' }}
+          
+          Next Steps:
+          {% if not _pxe_config_stat.stat.exists %}
+          1. PXE config will regenerate when VM boots
+          {% elif not (_has_stage2 | default(false)) %}
+          1. PXE config missing inst.stage2 parameter
+          2. Check Satellite templates: hammer template list --search PXE
+          3. Update kickstart_kernel_options snippet
+          {% elif _stage2_test is failed %}
+          1. inst.stage2 URL not reachable: {{ _stage2_url }}
+          2. Check Satellite content: hammer medium list
+          3. Verify repository sync: hammer repository list
+          {% endif %}
+          4. Boot VM and monitor: virsh console {{ vm_name }}
+          5. Check TFTP logs: tail -f /var/log/messages | grep tftp
+          
+          Manual Commands:
+          - Rebuild config: hammer host rebuild-config --name {{ _host_name }}
+          - List TFTP files: ls -lh {{ _pxe_config_path | dirname }}/
+          - Test TFTP: curl tftp://{{ inventory_hostname }}/{{ vm_mac_label }}
+
+  post_tasks:
+    - name: Final troubleshooting recommendations
+      ansible.builtin.debug:
+        msg: |
+          Troubleshooting Guide
+          =====================
+          
+          Common Issues:
+          1. PXE config not regenerating
+             - Solution: hammer host rebuild-config --name {{ _host_name }}
+          
+          2. TFTP timeout
+             - Check: systemctl status tftp.socket
+             - Check: firewall-cmd --list-services | grep tftp
+          
+          3. Boot files not found
+             - Check: ls -lh {{ sat_boot_dir }}/
+             - Sync: hammer repository synchronize --name "Red Hat Enterprise Linux"
+          
+          4. inst.stage2 unreachable
+             - Check: hammer medium list
+             - Update: hammer medium update --name "RHEL" --path "http://{{ inventory_hostname }}/pulp/content/..."
+          
+          Logs to Monitor:
+          - Satellite: tail -f /var/log/foreman/production.log
+          - TFTP: tail -f /var/log/messages | grep tftp
+          - KVM: virsh console {{ hostvars[groups['kvm'][0]]['vm_name'] }}

@@ -1,0 +1,458 @@
+---
+# Bulk Node Builder Playbook
+# Synopsis: Survey-driven high-performance bulk creation of Satellite hosts with sequential or gap numbering, adjustable concurrency (linear/free), optional batching, numeric padding, and dry-run safety.
+# Creates multiple Satellite hosts with survey-driven performance tuning parameters.
+# Designed for Ansible Automation Platform (AAP) Job Template with Survey fields.
+#
+# SURVEY VARIABLES (suggested):
+#   node_count (int)                - How many nodes to build (default 5)
+#   start_slot (int)                - First numeric slot to attempt (default: first available)
+#   node_prefix (str)               - Prefix for node names (default 'node')
+#   domain (str)                    - Domain suffix (default 'prod.spg')
+#   mac_address_prefix (str)        - First 5 octets of MAC (default '52:54:00:aa:bb')
+#   max_node_count (int)            - Safety cap (default 50)
+#   build_strategy (choice)         - 'linear' or 'free' (default 'linear')
+#   serial_batch (int)              - If >0, limits batch size per play (default 0 = all)
+#   require_confirmation (bool)     - Pause before starting (default true)
+#   confirmation_timeout (int)      - Seconds for pause (default 5)
+#   dry_run (bool)                  - If true, do not create hosts (default false)
+#   satellite_host (str)            - Satellite FQDN (default 'satellite.prod.spg')
+#   satellite_user (str)            - API username (default 'admin')
+#   satellite_password (password)   - API password (recommended via env var SATELLITE_PASSWORD)
+#   os_id, hostgroup_id, subnet_id, location_id, organization_id - Resource IDs (defaults below)
+#
+# PERFORMANCE NOTES:
+# - Concurrency is achieved by distributing node creation across dynamic host inventory and using forks/strategy.
+# - Set Job Template forks higher (e.g., 20) to parallelize API calls when build_strategy=free.
+# - serial_batch allows controlled batching to avoid API overload.
+# - Strategy cannot be templated directly; we provide two plays gated by when clauses.
+# - Job slicing (AAP feature) can further distribute across slices if desired.
+#
+# SAFETY:
+# - Validates node_count <= max_node_count and available slots.
+# - Confirmation pause (can disable).
+# - dry_run option for preview.
+
+- name: Bulk Node Builder - Planning Phase
+  hosts: localhost
+  gather_facts: false
+  vars:
+    node_count: "{{ node_count | default(5) | int }}"
+    start_slot: "{{ start_slot | default(None) }}"
+    node_prefix: "{{ node_prefix | default('node') }}"
+    domain: "{{ domain | default('prod.spg') }}"
+    mac_address_prefix: "{{ mac_address_prefix | default('52:54:00:aa:bb') }}"
+    max_node_count: "{{ max_node_count | default(50) | int }}"
+    build_strategy: "{{ build_strategy | default('linear') }}"  # linear|free
+    serial_batch: "{{ serial_batch | default(0) | int }}"
+    require_confirmation: "{{ require_confirmation | default(true) | bool }}"
+    confirmation_timeout: "{{ confirmation_timeout | default(5) | int }}"
+    dry_run: "{{ dry_run | default(false) | bool }}"
+    sequential_mode: "{{ sequential_mode | default(true) | bool }}"  # true: extend from highest existing; false: fill gaps from first available
+    number_padding: "{{ number_padding | default(3) | int }}"        # digits for zero padding (e.g., 3 => node007)
+    random_mac: "{{ random_mac | default(false) | bool }}"           # If true, MAC last octet pseudo-randomized (time+slot) instead of slot hex
+    export_path: "{{ export_path | default(omit) }}"                 # If defined, write CSV summary after creation
+
+    satellite_host: "{{ satellite_host | default('satellite.prod.spg') }}"
+    satellite_user: "{{ satellite_user | default('admin') }}"
+    satellite_password: "{{ satellite_password | default(lookup('env','SATELLITE_PASSWORD')) }}"
+
+    os_id: "{{ os_id | default(1) }}"
+    hostgroup_id: "{{ hostgroup_id | default(1) }}"
+    subnet_id: "{{ subnet_id | default(1) }}"
+    location_id: "{{ location_id | default(2) }}"
+    organization_id: "{{ organization_id | default(1) }}"
+    # Optional name-based lookup variables; if provided, override numeric IDs after API discovery
+    os_name: "{{ os_name | default(omit) }}"
+    hostgroup_name: "{{ hostgroup_name | default(omit) }}"
+    subnet_name: "{{ subnet_name | default(omit) }}"
+    location_name: "{{ location_name | default(omit) }}"
+    organization_name: "{{ organization_name | default(omit) }}"
+
+    api_retry_count: "{{ api_retry_count | default(3) | int }}"
+    api_retry_delay: "{{ api_retry_delay | default(5) | int }}"
+
+  tasks:
+    - name: Validate satellite password present
+      ansible.builtin.assert:
+        that:
+          - satellite_password | length > 0
+        fail_msg: "Satellite password missing. Provide via survey or export SATELLITE_PASSWORD."
+      no_log: true
+
+    - name: Validate node_count constraints
+      ansible.builtin.assert:
+        that:
+          - node_count > 0
+          - node_count <= max_node_count
+        fail_msg: "node_count must be 1..{{ max_node_count }} (requested {{ node_count }})"
+
+    - name: Lookup operating system ID by name (optional)
+      ansible.builtin.uri:
+        url: "https://{{ satellite_host }}/api/operatingsystems?search=name={{ os_name | urlencode }}"
+        method: GET
+        user: "{{ satellite_user }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: 200
+      register: _os_lookup
+      when: os_name is defined
+      no_log: true
+      changed_when: false
+
+    - name: Validate OS lookup result
+      ansible.builtin.assert:
+        that:
+          - _os_lookup.json.results | length > 0
+        fail_msg: "Operating System name '{{ os_name }}' not found"
+      when: os_name is defined
+
+    - name: Override os_id from name
+      ansible.builtin.set_fact:
+        os_id: "{{ _os_lookup.json.results[0].id }}"
+      when: os_name is defined
+
+    - name: Lookup hostgroup ID by name (optional)
+      ansible.builtin.uri:
+        url: "https://{{ satellite_host }}/api/hostgroups?search=name={{ hostgroup_name | urlencode }}"
+        method: GET
+        user: "{{ satellite_user }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: 200
+      register: _hg_lookup
+      when: hostgroup_name is defined
+      no_log: true
+      changed_when: false
+
+    - name: Validate hostgroup lookup result
+      ansible.builtin.assert:
+        that:
+          - _hg_lookup.json.results | length > 0
+        fail_msg: "Hostgroup name '{{ hostgroup_name }}' not found"
+      when: hostgroup_name is defined
+
+    - name: Override hostgroup_id from name
+      ansible.builtin.set_fact:
+        hostgroup_id: "{{ _hg_lookup.json.results[0].id }}"
+      when: hostgroup_name is defined
+
+    - name: Lookup subnet ID by name (optional)
+      ansible.builtin.uri:
+        url: "https://{{ satellite_host }}/api/subnets?search=name={{ subnet_name | urlencode }}"
+        method: GET
+        user: "{{ satellite_user }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: 200
+      register: _subnet_lookup
+      when: subnet_name is defined
+      no_log: true
+      changed_when: false
+
+    - name: Validate subnet lookup result
+      ansible.builtin.assert:
+        that:
+          - _subnet_lookup.json.results | length > 0
+        fail_msg: "Subnet name '{{ subnet_name }}' not found"
+      when: subnet_name is defined
+
+    - name: Override subnet_id from name
+      ansible.builtin.set_fact:
+        subnet_id: "{{ _subnet_lookup.json.results[0].id }}"
+      when: subnet_name is defined
+
+    - name: Lookup location ID by name (optional)
+      ansible.builtin.uri:
+        url: "https://{{ satellite_host }}/api/locations?search=name={{ location_name | urlencode }}"
+        method: GET
+        user: "{{ satellite_user }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: 200
+      register: _location_lookup
+      when: location_name is defined
+      no_log: true
+      changed_when: false
+
+    - name: Validate location lookup result
+      ansible.builtin.assert:
+        that:
+          - _location_lookup.json.results | length > 0
+        fail_msg: "Location name '{{ location_name }}' not found"
+      when: location_name is defined
+
+    - name: Override location_id from name
+      ansible.builtin.set_fact:
+        location_id: "{{ _location_lookup.json.results[0].id }}"
+      when: location_name is defined
+
+    - name: Lookup organization ID by name (optional)
+      ansible.builtin.uri:
+        url: "https://{{ satellite_host }}/api/organizations?search=name={{ organization_name | urlencode }}"
+        method: GET
+        user: "{{ satellite_user }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: 200
+      register: _org_lookup
+      when: organization_name is defined
+      no_log: true
+      changed_when: false
+
+    - name: Validate organization lookup result
+      ansible.builtin.assert:
+        that:
+          - _org_lookup.json.results | length > 0
+        fail_msg: "Organization name '{{ organization_name }}' not found"
+      when: organization_name is defined
+
+    - name: Override organization_id from name
+      ansible.builtin.set_fact:
+        organization_id: "{{ _org_lookup.json.results[0].id }}"
+      when: organization_name is defined
+
+    - name: Display resolved resource IDs
+      ansible.builtin.debug:
+        msg: |
+          Resolved Resource IDs
+          ---------------------
+          Operating System ID: {{ os_id }} {{ '(from ' + os_name + ')' if os_name is defined else '' }}
+          Hostgroup ID:       {{ hostgroup_id }} {{ '(from ' + hostgroup_name + ')' if hostgroup_name is defined else '' }}
+          Subnet ID:          {{ subnet_id }} {{ '(from ' + subnet_name + ')' if subnet_name is defined else '' }}
+          Location ID:        {{ location_id }} {{ '(from ' + location_name + ')' if location_name is defined else '' }}
+          Organization ID:    {{ organization_id }} {{ '(from ' + organization_name + ')' if organization_name is defined else '' }}
+
+    - name: Capture epoch timestamp for MAC randomness
+      ansible.builtin.set_fact:
+        _epoch: "{{ lookup('pipe','date +%s') | int }}"
+
+    - name: Fetch existing hosts (for slot calculation)
+      ansible.builtin.uri:
+        url: "https://{{ satellite_host }}/api/hosts?per_page=10000"
+        method: GET
+        user: "{{ satellite_user }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: 200
+      register: _hosts
+      retries: "{{ api_retry_count }}"
+      delay: "{{ api_retry_delay }}"
+      until: _hosts.status == 200
+      no_log: true
+
+    - name: Extract existing node numbers
+      ansible.builtin.set_fact:
+        _existing_numbers: "{{ _hosts.json.results | selectattr('name','match','^' + node_prefix + '[0-9]{3}\\.' + domain + '$') | map(attribute='name') | map('regex_replace','^' + node_prefix + '([0-9]{3})\\..*','\\1') | map('int') | list }}"
+
+    - name: Build available slots list
+      ansible.builtin.set_fact:
+        _slots: "{{ range(1, 1000) | list | difference(_existing_numbers) }}"
+
+    - name: Determine starting slot
+      ansible.builtin.set_fact:
+        _max_existing: "{{ (_existing_numbers | length > 0) | ternary((_existing_numbers | max), 0) }}"
+        _start_slot: >-
+          {{
+            (start_slot | int)
+              if start_slot is not none
+              else (
+                sequential_mode
+                  | ternary(_max_existing + 1, _slots[0])
+              )
+          }}
+
+    - name: Select slot sequence (sequential_mode vs gap fill)
+      ansible.builtin.set_fact:
+        _selected_slots: >-
+          {{
+            sequential_mode
+              | ternary(range(_start_slot, _start_slot + node_count) | list,
+                        (_slots | reject('lt', _start_slot) | list | slice(node_count)))
+          }}
+
+    - name: Validate sufficient slots
+      ansible.builtin.assert:
+        that:
+          - _selected_slots | length == node_count
+        fail_msg: "Insufficient available slots starting at {{ _start_slot }} for node_count={{ node_count }}"
+
+    - name: Prepare node objects
+      ansible.builtin.set_fact:
+        _nodes_json: |
+          [
+          {% for slot in _selected_slots %}
+            {
+              "slot": {{ slot }},
+              "name": "{{ node_prefix }}{{ ('%0' + number_padding|string + 'd') | format(slot) }}",
+              "fqdn": "{{ node_prefix }}{{ ('%0' + number_padding|string + 'd') | format(slot) }}.{{ domain }}",
+              "mac": "{{ mac_address_prefix }}:{{ '%02x' | format(slot) if not random_mac else '%02x' | format((_epoch + slot) % 256) }}"
+            }{{ ',' if not loop.last else '' }}
+          {% endfor %}
+          ]
+
+    - name: Parse node objects
+      ansible.builtin.set_fact:
+        _nodes: "{{ _nodes_json | from_json }}"
+
+    - name: Display build plan
+      ansible.builtin.debug:
+        msg: |
+          Bulk Node Build Plan
+          ====================
+          Strategy: {{ build_strategy }}  (adjust Job Template forks for parallelism)
+          Serial batch: {{ serial_batch if serial_batch > 0 else 'All'}}
+          Dry run: {{ dry_run }}
+          Random MAC: {{ random_mac }} (time+slot based last octet when true)
+          Nodes to create: {{ node_count }}
+          First slot: {{ _start_slot }}
+          Satellite: {{ satellite_host }}
+          Resource IDs -> OS: {{ os_id }}, HG: {{ hostgroup_id }}, Subnet: {{ subnet_id }}, Loc: {{ location_id }}, Org: {{ organization_id }}
+
+          Nodes:
+          {% for n in _nodes %}{{ n.name }}  MAC={{ n.mac }}{% endfor %}
+
+    - name: Confirmation pause
+      ansible.builtin.pause:
+        seconds: "{{ confirmation_timeout }}"
+        prompt: "Proceeding with creation in {{ confirmation_timeout }} seconds (Ctrl+C to abort)"
+      when: require_confirmation and not dry_run
+
+    - name: Add dynamic hosts for parallel creation
+      ansible.builtin.add_host:
+        name: "builder_{{ item.name }}"
+        groups: build_targets
+        slot: "{{ item.slot }}"
+        node_name: "{{ item.name }}"
+        node_fqdn: "{{ item.fqdn }}"
+        node_mac: "{{ item.mac }}"
+      loop: "{{ _nodes }}"
+
+- name: Bulk Node Builder - Creation (linear strategy)
+  hosts: build_targets
+  gather_facts: false
+  strategy: linear
+  serial: "{{ serial_batch if serial_batch > 0 else omit }}"
+  vars:
+    satellite_host: "{{ hostvars['localhost'].satellite_host }}"
+    satellite_user: "{{ hostvars['localhost'].satellite_user }}"
+    satellite_password: "{{ hostvars['localhost'].satellite_password }}"
+    os_id: "{{ hostvars['localhost'].os_id }}"
+    hostgroup_id: "{{ hostvars['localhost'].hostgroup_id }}"
+    subnet_id: "{{ hostvars['localhost'].subnet_id }}"
+    location_id: "{{ hostvars['localhost'].location_id }}"
+    organization_id: "{{ hostvars['localhost'].organization_id }}"
+    dry_run: "{{ hostvars['localhost'].dry_run }}"
+  tasks:
+    - name: Skip when free strategy selected
+      ansible.builtin.meta: end_play
+      when: hostvars['localhost'].build_strategy != 'linear'
+
+    - name: Create host (linear)
+      ansible.builtin.uri:
+        url: "https://{{ satellite_host }}/api/hosts"
+        method: POST
+        user: "{{ satellite_user }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: json
+        body:
+          host:
+            name: "{{ node_name }}"
+            mac: "{{ node_mac }}"
+            operatingsystem_id: "{{ os_id }}"
+            hostgroup_id: "{{ hostgroup_id }}"
+            subnet_id: "{{ subnet_id }}"
+            location_id: "{{ location_id }}"
+            organization_id: "{{ organization_id }}"
+            build: true
+            enabled: true
+            managed: true
+        status_code: 201
+      register: _create
+      when: not dry_run
+      no_log: true
+
+    - name: Report creation status (linear)
+      ansible.builtin.debug:
+        msg: "{{ node_name }} -> {{ 'CREATED id=' + _create.json.id | string if (not dry_run and _create.status == 201) else (dry_run | ternary('DRY-RUN','FAILED')) }}"
+
+- name: Bulk Node Builder - Creation (free strategy)
+  hosts: build_targets
+  gather_facts: false
+  strategy: free
+  serial: "{{ serial_batch if serial_batch > 0 else omit }}"
+  vars:
+    satellite_host: "{{ hostvars['localhost'].satellite_host }}"
+    satellite_user: "{{ hostvars['localhost'].satellite_user }}"
+    satellite_password: "{{ hostvars['localhost'].satellite_password }}"
+    os_id: "{{ hostvars['localhost'].os_id }}"
+    hostgroup_id: "{{ hostvars['localhost'].hostgroup_id }}"
+    subnet_id: "{{ hostvars['localhost'].subnet_id }}"
+    location_id: "{{ hostvars['localhost'].location_id }}"
+    organization_id: "{{ hostvars['localhost'].organization_id }}"
+    dry_run: "{{ hostvars['localhost'].dry_run }}"
+  tasks:
+    - name: Skip when linear strategy selected
+      ansible.builtin.meta: end_play
+      when: hostvars['localhost'].build_strategy != 'free'
+
+    - name: Create host (free)
+      ansible.builtin.uri:
+        url: "https://{{ satellite_host }}/api/hosts"
+        method: POST
+        user: "{{ satellite_user }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: json
+        body:
+          host:
+            name: "{{ node_name }}"
+            mac: "{{ node_mac }}"
+            operatingsystem_id: "{{ os_id }}"
+            hostgroup_id: "{{ hostgroup_id }}"
+            subnet_id: "{{ subnet_id }}"
+            location_id: "{{ location_id }}"
+            organization_id: "{{ organization_id }}"
+            build: true
+            enabled: true
+            managed: true
+        status_code: 201
+      register: _create
+      when: not dry_run
+      no_log: true
+
+    - name: Report creation status (free)
+      ansible.builtin.debug:
+        msg: "{{ node_name }} -> {{ 'CREATED id=' + _create.json.id | string if (not dry_run and _create.status == 201) else (dry_run | ternary('DRY-RUN','FAILED')) }}"
+
+- name: Bulk Node Builder - Summary
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Summarize results
+      ansible.builtin.debug:
+        msg: |
+          Bulk Node Builder Completed
+          Strategy: {{ build_strategy }}
+          Dry run: {{ dry_run }}
+          Nodes processed: {{ _nodes | length }}
+          Review Satellite UI or hammer host list for newly created hosts.
+
+    - name: Build export CSV (if requested)
+      ansible.builtin.copy:
+        dest: "{{ export_path }}"
+        content: |
+          name,id,mac,slot,timestamp,status
+          {% for h in groups['build_targets'] %}
+          {{ hostvars[h].node_name }},{{ (hostvars[h]._create.json.id if (hostvars[h]._create is defined and hostvars[h]._create.status==201) else '') }},{{ hostvars[h].node_mac }},{{ hostvars[h].slot }},{{ lookup('pipe','date +%Y-%m-%dT%H:%M:%S') }},{{ (hostvars[h]._create.status==201) | ternary('CREATED', (dry_run | ternary('DRY-RUN','FAILED'))) }}
+          {% endfor %}
+      when: export_path is defined
