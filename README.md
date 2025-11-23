@@ -120,7 +120,7 @@ ansible-playbook playbooks/ansible_configuration/configure_aap_job_templates.yml
   -e controller_host=https://ansible.prod.spg \
   -e organization_name="Default" \
   -e project_name="AnsibleSatellite" \
-  -e inventory_name="Satellite Inventory" \
+  -e inventory_name="Satellite" \
   -e controller_oauthtoken=$CONTROLLER_OAUTH_TOKEN
 ```
 
@@ -128,6 +128,14 @@ Tips
 - Alternatively provide username/password: -e controller_username=admin -e controller_password=... (or set CONTROLLER_USERNAME/CONTROLLER_PASSWORD env vars).
 - Create a local `controller_vars.yml` by copying `playbooks/ansible_configuration/controller_vars.yml.example` and editing values; it will be auto-loaded.
 - Surveys avoid hardcoding secrets. For Satellite/API passwords, prefer Controller Credentials or env vars (e.g., SATELLITE_PASSWORD) at launch time.
+- The playbook auto-triggers a project sync before creating templates. Ensure a `requirements.yml` exists at the repo root (even an empty one) so role/collection install steps do not fail. Example minimal file:
+  ```yaml
+  ---
+  collections: []
+  roles: []
+  ```
+- Template ID resolution is now resilient: IDs are first harvested directly from creation results, then any missing IDs are looked up via name queries. This eliminates prior "Failed to resolve one or more Job Template IDs" errors.
+- Endpoint detection automatically tests `/api/controller/v2`, gateway paths, and falls back to `/api/v2/ping` to handle varied AAP deployments.
 
 Templates created and their Surveys
 - Bulk Node Builder → `playbooks/node_provisioning/bulk_node_builder.yml`
@@ -170,6 +178,17 @@ ansible-playbook playbooks/ansible_configuration/configure_aap_job_templates.yml
 
 Workflow name: “Satellite Provisioning Pipeline” (override with -e workflow_name=...)
 
+Workflow Notes
+- Inventory used for all nodes defaults to the value of `inventory_name` (example above uses `Satellite`).
+- Re-running the configuration playbook is idempotent: workflow nodes and success links are recreated/updated without duplication.
+- To attach credentials (e.g., machine, Satellite API, Git SCM) automatically, populate `controller_vars.yml` with lists such as:
+  ```yaml
+  machine_credential_name: "Linux Machine Credential"
+  satellite_api_credential_name: "Satellite API Credential"
+  scm_credential_name: "GitHub SCM Credential"
+  ```
+  Then re-run the playbook; it will associate them when those credential names exist in Controller.
+
 Workflow survey fields (subset)
 - satellite_url, satellite_username, satellite_password (optional)
 - template_name, template_file
@@ -180,7 +199,8 @@ Workflow survey fields (subset)
 Notes
 - All templates are created idempotently. Re-running will update Surveys and settings.
 - Set execution environment, inventory, and credentials via the template playbook variables (see controller_vars example) or edit in the UI post-creation.
- - If your AAP is fronted by the API Gateway, ensure that the Controller path is reachable (e.g., https://<host>/api/controller/v2/ or https://<host>/api/gateway/v1/automation-controller/v2/). This playbook auto-detects a working endpoint.
+- If your AAP is fronted by the API Gateway, ensure that the Controller path is reachable (e.g., https://<host>/api/controller/v2/ or https://<host>/api/gateway/v1/automation-controller/v2/). This playbook auto-detects a working endpoint.
+- If a project sync fails, check for a missing `requirements.yml`; add it and re-run. The playbook now pauses briefly after launching the sync to avoid race conditions where playbooks were previously not yet available.
 
 ## Core playbooks
 

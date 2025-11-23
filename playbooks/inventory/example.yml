@@ -1,0 +1,9 @@
+---
+all:
+  children:
+    satellite:
+      hosts:
+        satellite.prod.spg:
+    kvm:
+      hosts:
+        kaso.prod.spg:

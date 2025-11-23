@@ -23,7 +23,7 @@ controller_verify_ssl: false
 # Organization and Project
 # ========================================
 organization_name: "Default"
-project_name: "AnsibleLaunchPad"
+project_name: "AnsibleSatellite"
 
 # ========================================
 # Inventory and Credentials

@@ -39,7 +39,8 @@
   vars:
     node_count: "{{ node_count | default(5) | int }}"
     start_slot: "{{ start_slot | default(None) }}"
-    node_prefix: "{{ node_prefix | default('node') }}"
+    # Optional alias 'shortname' to override node_prefix
+    node_prefix: "{{ (shortname | default(None)) | default(node_prefix | default('node')) }}"
     domain: "{{ domain | default('prod.spg') }}"
     mac_address_prefix: "{{ mac_address_prefix | default('52:54:00:aa:bb') }}"
     max_node_count: "{{ max_node_count | default(50) | int }}"
@@ -48,6 +49,8 @@
     require_confirmation: "{{ require_confirmation | default(true) | bool }}"
     confirmation_timeout: "{{ confirmation_timeout | default(5) | int }}"
     dry_run: "{{ dry_run | default(false) | bool }}"
+    # When true, skip Satellite API host fetch and assume empty environment for planning
+    offline_planning: "{{ offline_planning | default(false) | bool }}"
     sequential_mode: "{{ sequential_mode | default(true) | bool }}"  # true: extend from highest existing; false: fill gaps from first available
     number_padding: "{{ number_padding | default(3) | int }}"        # digits for zero padding (e.g., 3 => node007)
     random_mac: "{{ random_mac | default(false) | bool }}"           # If true, MAC last octet pseudo-randomized (time+slot) instead of slot hex
@@ -246,6 +249,14 @@
       delay: "{{ api_retry_delay }}"
       until: _hosts.status == 200
       no_log: true
+      when: not offline_planning
+
+    - name: Assume empty host list when offline_planning
+      ansible.builtin.set_fact:
+        _hosts:
+          json:
+            results: []
+      when: offline_planning
 
     - name: Extract existing node numbers
       ansible.builtin.set_fact:
@@ -282,6 +293,12 @@
         that:
           - _selected_slots | length == node_count
         fail_msg: "Insufficient available slots starting at {{ _start_slot }} for node_count={{ node_count }}"
+
+    - name: Enforce 3-digit numbering limit (<= 999)
+      ansible.builtin.assert:
+        that:
+          - (_selected_slots | max) <= 999
+        fail_msg: "Selected slots exceed 999 (max={{ (_selected_slots | max) }}). Reduce node_count or start_slot."
 
     - name: Prepare node objects
       ansible.builtin.set_fact:

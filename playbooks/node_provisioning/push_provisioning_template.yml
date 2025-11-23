@@ -29,7 +29,9 @@
     # Prefer environment variable SATELLITE_PASSWORD if not passed explicitly
     satellite_password: "{{ satellite_password | default(lookup('env','SATELLITE_PASSWORD')) }}"
     template_name: "RHEL 9.7 x86_64 Post-Kickstart Default"
-    template_file: "AnsibleSatellite/playbooks/node_provisioning/templates/RHEL_9.7_x86_64_post_kickstart_default.erb"
+    # Path is now derived from the playbook directory so it is agnostic to the current working directory
+    # and repository name. Override with -e template_file=/path/to/your.erb if desired.
+    template_file: "{{ playbook_dir }}/templates/RHEL_9.7_x86_64_post_kickstart_default.erb"
     template_kind: "provision"
     audit_comment: "Managed via automation push_provisioning_template.yml"
 

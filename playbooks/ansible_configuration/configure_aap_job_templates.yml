@@ -30,12 +30,34 @@
     satellite_api_credential_name: ""
     execution_environment: ""
 
+    # Automation toggles (new)
+    auto_create_credentials: false  # When true, attempt creation of missing machine / satellite API credentials
+    auto_retry_job_template_creation: true  # When true, retry job template creation after forced project resync if playbook not found
+    project_sync_poll: true  # Poll project update endpoint until finished instead of blind sleep
+    project_sync_timeout: 120  # Seconds maximum wait for project sync job to finish
+    project_sync_poll_interval: 6  # Seconds between status checks
+
+    # Credential creation inputs (used only if auto_create_credentials=true)
+    machine_credential_username: "root"
+    machine_credential_password: ""  # optional ssh password, prefer key injection separately
+    satellite_api_credential_username: "admin"
+    satellite_api_credential_password: ""  # if blank and surveys supply password, credential may be created without secret
+    scm_credential_type: "Source Control"  # create if scm_credential_name provided & auto_create_credentials=true
+    scm_credential_username: ""  # for HTTPS git; alternatively supply token as password
+    scm_credential_password: ""  # token/password
+
     # Project source (used only if auto-create requested)
     project_scm_url: ""
     project_scm_branch: "main"
     auto_create_project: false
     auto_create_inventory: false
     scm_credential_name: ""
+
+    # Preflight network diagnostics toggle
+    auto_network_preflight: true
+    normalize_controller_host: true  # Strip any accidental /api/... fragments from controller_host
+    strip_known_api_prefixes: true   # Remove /api/controller/v2, /api/gateway/v1/... if user pasted full path
+    auto_insecure_on_cert_failure: false  # If true, automatically flip controller_verify_ssl to false after CERT failure
     
     # Retry configuration
     api_retry_count: 3
@@ -510,6 +532,40 @@
       no_log: true
       tags: always
 
+    - name: Normalize controller_host (remove protocol path fragments)
+      when: normalize_controller_host | bool
+      block:
+        - name: Capture raw controller_host
+          ansible.builtin.set_fact:
+            _controller_host_raw: "{{ controller_host }}"
+
+        - name: Strip trailing slashes
+          ansible.builtin.set_fact:
+            controller_host: "{{ controller_host | regex_replace('/+$','') }}"
+
+        - name: Remove embedded /api/... path if present
+          ansible.builtin.set_fact:
+            controller_host: "{{ controller_host | regex_replace('/api/.*$','') }}"
+          when: strip_known_api_prefixes | bool and (controller_host is match('/api/') )
+
+        - name: Ensure protocol present (default https if missing)
+          ansible.builtin.set_fact:
+            controller_host: "https://{{ controller_host }}"
+          when: controller_host is not match('^https?://')
+
+        - name: Strip double protocol (edge case user includes http twice)
+          ansible.builtin.set_fact:
+            controller_host: "{{ controller_host | regex_replace('^(https?://)+','https://') }}"
+
+        - name: Display normalization result
+          ansible.builtin.debug:
+            msg: |
+              Controller host normalized.
+              Raw input: {{ _controller_host_raw }}
+              Normalized: {{ controller_host }}
+              (Paths like /api/controller/v2 automatically removed.)
+      tags: always
+
     - name: Interactive credential prompt (if no auth provided)
       block:
         - name: Prompt for Controller username
@@ -570,6 +626,54 @@
           - Extra vars: -e controller_host=https://ansible.prod.spg
           - controller_vars.yml file (copy controller_vars.yml.example)
         success_msg: "Required configuration validated"
+      tags: always
+
+    - name: Preflight network diagnostics (DNS + TCP) before API probes
+      when: auto_network_preflight | bool
+      block:
+        - name: Extract hostname portion (strip protocol)
+          ansible.builtin.set_fact:
+            _controller_host_base: "{{ controller_host | regex_replace('^https?://','') | regex_replace('/.*','') }}"
+
+        - name: DNS lookup for Controller host
+          ansible.builtin.command: getent hosts {{ _controller_host_base }}
+          register: _dns_lookup
+          changed_when: false
+          failed_when: false
+
+        - name: Set DNS resolution fact
+          ansible.builtin.set_fact:
+            _dns_resolved: "{{ _dns_lookup.rc == 0 }}"
+
+        - name: Attempt TCP connectivity to 443 (short timeout)
+          ansible.builtin.wait_for:
+            host: "{{ _controller_host_base }}"
+            port: 443
+            timeout: 3
+          register: _tcp_test
+          failed_when: false
+          changed_when: false
+
+        - name: Summarize preflight diagnostics
+          ansible.builtin.debug:
+            msg: |
+              Preflight network diagnostics:
+              Host: {{ _controller_host_base }}
+              DNS resolved: {{ _dns_resolved }}
+              TCP 443 reachable: {{ (_tcp_test.elapsed is defined) | ternary('yes','no') }}
+              Hint: If DNS=false or TCP=false, fix name resolution or firewall before continuing.
+
+        - name: Abort early due to unresolved host
+          ansible.builtin.fail:
+            msg: |
+              Controller host '{{ _controller_host_base }}' did not resolve (DNS lookup failed).
+              Update controller_host extra-var to a reachable FQDN or add DNS/hosts entry.
+          when: not _dns_resolved
+
+        - name: Warn about TCP unreachable but continue (Controller may be down)
+          ansible.builtin.debug:
+            msg: "Controller host '{{ _controller_host_base }}' port 443 unreachable (timeout). Will attempt API probes anyway."
+          when: _dns_resolved and (_tcp_test.elapsed is not defined)
       tags: always
 
     - name: Probe Controller API (controller/v2)
@@ -658,6 +762,25 @@
             ('CERTIFICATE_VERIFY_FAILED' in (_api_ping_gateway_controller.msg | default(''))) or
             ('CERTIFICATE_VERIFY_FAILED' in (_api_ping_v2.msg | default('')))
           }}
+      tags: always
+
+    - name: Auto-switch to insecure verification on cert failure
+      when:
+        - _api_base | length == 0
+        - _ssl_verify_error | bool
+        - auto_insecure_on_cert_failure | bool
+        - controller_verify_ssl | bool
+      block:
+        - name: Log auto-switch warning
+          ansible.builtin.debug:
+            msg: |
+              SSL certificate verification failed; auto_insecure_on_cert_failure=true so continuing with controller_verify_ssl=false.
+              ORIGINAL host: {{ controller_host }}
+              Consider installing CA bundle instead of disabling verification.
+
+        - name: Disable SSL verification dynamically
+          ansible.builtin.set_fact:
+            controller_verify_ssl: false
       tags: always
 
     - name: Re-probe API endpoints without SSL verification (fallback)
@@ -979,6 +1102,240 @@
         - not auto_create_inventory
       tags: setup
 
+    # ========================================
+    # Credential & Execution Environment Discovery (Optional)
+    # ========================================
+    - name: Build unique credential name list
+      ansible.builtin.set_fact:
+        _all_credential_names: >-
+          {{
+            ([credential_name, machine_credential_name, satellite_api_credential_name, scm_credential_name] +
+            (job_templates | map(attribute='credential_names') | flatten))
+            | reject('equalto','') | reject('equalto', None) | list | unique
+          }}
+      tags: setup
+
+    - name: Query credentials by name
+      ansible.builtin.uri:
+        url: "{{ controller_host }}{{ _api_base }}/credentials/?name={{ item | urlencode }}&organization={{ _org_id }}"
+        method: GET
+        return_content: true
+        status_code: 200
+        validate_certs: "{{ controller_verify_ssl }}"
+        headers: "{{ {'Authorization': 'Bearer ' ~ _controller_token} if (_controller_token | length > 0) else omit }}"
+        url_username: "{{ _controller_username if (_controller_token | length == 0) else omit }}"
+        url_password: "{{ _controller_password if (_controller_token | length == 0) else omit }}"
+        force_basic_auth: "{{ true if (_controller_token | length == 0) else omit }}"
+      loop: "{{ _all_credential_names }}"
+      loop_control:
+        label: "{{ item }}"
+      register: _credential_queries
+      when: _all_credential_names | length > 0
+      tags: setup
+
+    - name: Build credential id map
+      ansible.builtin.set_fact:
+        _credential_id_map: |
+          {% set m = {} %}
+          {% for r in _credential_queries.results | default([]) %}
+          {%   set id = (r.json.results | default([])) | first | default({}) | json_query('id') | default(None) %}
+          {%   set _ = m.update({ r.item: id }) %}
+          {% endfor %}
+          {{ m }}
+      when: _all_credential_names | length > 0
+      tags: setup
+
+    - name: Determine missing credentials (for optional auto-create)
+      ansible.builtin.set_fact:
+        _missing_credentials: "{{ _credential_id_map | dict2items | selectattr('value','equalto', None) | map(attribute='key') | list }}"
+      when: _credential_id_map is defined
+      tags: setup
+
+    - name: Auto-create missing credentials (machine, satellite API, SCM)
+      when:
+        - auto_create_credentials | bool
+        - _missing_credentials | length > 0
+      block:
+        - name: Prepare auto-create credential specs list
+          ansible.builtin.set_fact:
+            _auto_credential_specs: |
+              {% set specs = [] %}
+              {% if machine_credential_name | length > 0 and machine_credential_name in _missing_credentials %}
+              {%   set _ = specs.append({
+                     'name': machine_credential_name,
+                     'type': 'Machine',
+                     'inputs': {
+                       'username': machine_credential_username,
+                       'password': machine_credential_password if machine_credential_password | length > 0 else None
+                     }
+                   }) %}
+              {% endif %}
+              {% if satellite_api_credential_name | length > 0 and satellite_api_credential_name in _missing_credentials %}
+              {%   set _ = specs.append({
+                     'name': satellite_api_credential_name,
+                     'type': 'Machine',
+                     'inputs': {
+                       'username': satellite_api_credential_username,
+                       'password': satellite_api_credential_password if satellite_api_credential_password | length > 0 else None
+                     }
+                   }) %}
+              {% endif %}
+              {% if scm_credential_name | length > 0 and scm_credential_name in _missing_credentials %}
+              {%   set _ = specs.append({
+                     'name': scm_credential_name,
+                     'type': scm_credential_type,
+                     'inputs': {
+                       'username': scm_credential_username if scm_credential_username | length > 0 else None,
+                       'password': scm_credential_password if scm_credential_password | length > 0 else None
+                     }
+                   }) %}
+              {% endif %}
+              {{ specs }}
+
+        - name: Initialize credential results list
+          when: _auto_credential_specs | length > 0
+          ansible.builtin.set_fact:
+            _auto_created_results: []
+
+        - name: Primary credential create (all specs)
+          when: _auto_credential_specs | length > 0
+          ansible.controller.credential:
+            controller_host: "{{ controller_host }}"
+            controller_oauthtoken: "{{ _controller_token if _controller_token | length > 0 else omit }}"
+            controller_username: "{{ _controller_username if (_controller_token | length == 0 and _controller_username | length > 0) else omit }}"
+            controller_password: "{{ _controller_password if (_controller_token | length == 0 and _controller_password | length > 0) else omit }}"
+            validate_certs: "{{ controller_verify_ssl }}"
+            name: "{{ item.name }}"
+            description: "Auto-created by configure_aap_job_templates.yml"
+            organization: "{{ organization_name }}"
+            credential_type: "{{ item.type }}"
+            inputs:
+              username: "{{ item.inputs.username | default('', true) }}"
+              password: "{{ (item.inputs.password | default('', true)) if ((item.inputs.password | default('', true)) | length > 0) else omit }}"
+            state: present
+          loop: "{{ _auto_credential_specs }}"
+          loop_control:
+            label: "{{ item.name }}"
+          register: _cred_primary_results
+          failed_when: false
+
+        - name: Fallback creation for failed non-Machine credentials
+          when: _auto_credential_specs | length > 0
+          ansible.controller.credential:
+            controller_host: "{{ controller_host }}"
+            controller_oauthtoken: "{{ _controller_token if _controller_token | length > 0 else omit }}"
+            controller_username: "{{ _controller_username if (_controller_token | length == 0 and _controller_username | length > 0) else omit }}"
+            controller_password: "{{ _controller_password if (_controller_token | length == 0 and _controller_password | length > 0) else omit }}"
+            validate_certs: "{{ controller_verify_ssl }}"
+            name: "{{ item.item.name }}"
+            description: "Auto-created fallback (Machine) by configure_aap_job_templates.yml"
+            organization: "{{ organization_name }}"
+            credential_type: "Machine"
+            inputs:
+              username: "{{ item.item.inputs.username | default('', true) }}"
+              password: "{{ (item.item.inputs.password | default('', true)) if ((item.item.inputs.password | default('', true)) | length > 0) else omit }}"
+            state: present
+          loop: "{{ _cred_primary_results.results | default([]) | selectattr('failed') | selectattr('item.type','ne','Machine') | list }}"
+          loop_control:
+            label: "{{ item.item.name }}"
+          register: _cred_fallback_results
+          failed_when: false
+
+        - name: Aggregate credential creation outcome
+          when: _auto_credential_specs | length > 0
+          ansible.builtin.set_fact:
+            _auto_created_results: |
+              {% set final = [] %}
+              {% for r in _cred_primary_results.results | default([]) %}
+              {%   if r.failed and r.item.type != 'Machine' %}
+              {%     set fb = (_cred_fallback_results.results | default([])) | selectattr('item.item.name','equalto', r.item.name) | list | first | default(r) %}
+              {%     set _ = final.append(fb) %}
+              {%   else %}
+              {%     set _ = final.append(r) %}
+              {%   endif %}
+              {% endfor %}
+              {{ final }}
+
+        - name: Summarize credential creation failures
+          ansible.builtin.debug:
+            msg: |
+              Credential creation summary:
+              {% for r in _auto_created_results %}
+              - {{ r.name | default(r.item.name | default('UNKNOWN')) }} : {{ 'FAILED' if r.failed | default(false) else 'ok' }}{% if r.failed %} (msg={{ r.msg | default('n/a') }}){% endif %}
+              {% endfor %}
+          when: _auto_created_results | length > 0
+
+        - name: Set credential failure fact
+          ansible.builtin.set_fact:
+            _auto_credential_failures: "{{ _auto_created_results | selectattr('failed') | list }}"
+          when: _auto_created_results | length > 0
+
+        - name: Re-query credentials after auto-create
+          ansible.builtin.uri:
+            url: "{{ controller_host }}{{ _api_base }}/credentials/?name={{ item | urlencode }}&organization={{ _org_id }}"
+            method: GET
+            return_content: true
+            status_code: 200
+            validate_certs: "{{ controller_verify_ssl }}"
+            headers: "{{ {'Authorization': 'Bearer ' ~ _controller_token} if (_controller_token | length > 0) else omit }}"
+            url_username: "{{ _controller_username if (_controller_token | length == 0) else omit }}"
+            url_password: "{{ _controller_password if (_controller_token | length == 0) else omit }}"
+            force_basic_auth: "{{ true if (_controller_token | length == 0) else omit }}"
+          loop: "{{ _missing_credentials }}"
+          register: _credential_requeries
+          when: _missing_credentials | length > 0
+
+        - name: Update credential id map after auto-create
+          ansible.builtin.set_fact:
+            _credential_id_map: |
+              {% set m = _credential_id_map.copy() %}
+              {% for r in _credential_requeries.results | default([]) %}
+              {%   set id = (r.json.results | default([])) | first | default({}) | json_query('id') | default(None) %}
+              {%   if id is not none %}{% set _ = m.update({ r.item: id }) %}{% endif %}
+              {% endfor %}
+              {{ m }}
+          when: _credential_requeries is defined
+      tags: setup
+
+    - name: Warn about missing credentials
+      ansible.builtin.debug:
+        msg: |
+          The following credential names were not found in organization '{{ organization_name }}':
+          {% for n in _credential_id_map.keys() %}
+          {%   if _credential_id_map[n] is none %}- {{ n }}{% endif %}
+          {% endfor %}
+          They will be skipped. Create credentials or adjust names if needed.
+      when: _credential_id_map is defined and (_credential_id_map | dict2items | selectattr('value','equalto', None) | list | length) > 0
+      tags: setup
+
+    - name: Lookup execution environment by name (global)
+      ansible.builtin.uri:
+        url: "{{ controller_host }}{{ _api_base }}/execution_environments/?name={{ execution_environment | urlencode }}&organization={{ _org_id }}"
+        method: GET
+        return_content: true
+        status_code: 200
+        validate_certs: "{{ controller_verify_ssl }}"
+        headers: "{{ {'Authorization': 'Bearer ' ~ _controller_token} if (_controller_token | length > 0) else omit }}"
+        url_username: "{{ _controller_username if (_controller_token | length == 0) else omit }}"
+        url_password: "{{ _controller_password if (_controller_token | length == 0) else omit }}"
+        force_basic_auth: "{{ true if (_controller_token | length == 0) else omit }}"
+      register: _ee_query
+      when: execution_environment | length > 0
+      failed_when: false
+      tags: setup
+
+    - name: Set execution environment id fact
+      ansible.builtin.set_fact:
+        _ee_id: "{{ (_ee_query.json.results | default([])) | first | default({}) | json_query('id') | default(None) }}"
+      when: execution_environment | length > 0
+      tags: setup
+
+    - name: Warn if execution environment not found
+      ansible.builtin.debug:
+        msg: "Execution environment '{{ execution_environment }}' not found; templates will use default EE or project EE."
+      when: execution_environment | length > 0 and _ee_id is not defined or _ee_id is none
+      tags: setup
+
   tasks:
     - name: Derive project id (from query or creation)
       ansible.builtin.set_fact:
@@ -1022,6 +1379,37 @@
         - _project_id is defined
         - _project_id is not none
         - project_scm_url | length > 0
+        - not project_sync_poll | bool
+      tags: setup
+
+    - name: Poll project sync status until complete (optional)
+      when:
+        - project_sync_poll | bool
+        - _project_sync.json is defined
+        - _project_sync.json.id is defined
+        - project_scm_url | length > 0
+      block:
+        - name: Wait for project sync completion
+          ansible.builtin.uri:
+            url: "{{ controller_host }}{{ _api_base }}/project_updates/{{ _project_sync.json.id }}/"
+            method: GET
+            return_content: true
+            status_code: 200
+            validate_certs: "{{ controller_verify_ssl }}"
+            headers: "{{ {'Authorization': 'Bearer ' ~ _controller_token} if (_controller_token | length > 0) else omit }}"
+            url_username: "{{ _controller_username if (_controller_token | length == 0) else omit }}"
+            url_password: "{{ _controller_password if (_controller_token | length == 0) else omit }}"
+            force_basic_auth: "{{ true if (_controller_token | length == 0) else omit }}"
+          register: _sync_status
+          until: _sync_status.json.finished is defined
+          retries: "{{ (project_sync_timeout // project_sync_poll_interval) | int }}"
+          delay: "{{ project_sync_poll_interval }}"
+          failed_when: false
+
+        - name: Warn if sync timeout reached
+          ansible.builtin.debug:
+            msg: "Project sync may still be running after timeout ({{ project_sync_timeout }}s); proceeding. Last status: {{ _sync_status.json.state | default('unknown') }}"
+          when: _sync_status.json.finished is not defined
       tags: setup
 
     - name: Ensure ansible.controller collection is available
@@ -1062,7 +1450,21 @@
         inventory: "{{ inventory_name }}"
         playbook: "{{ item.playbook }}"
         job_type: run
-        execution_environment: "{{ execution_environment if execution_environment | length > 0 else omit }}"
+        execution_environment: "{{ _ee_id if (_ee_id is defined and _ee_id is not none) else (execution_environment if execution_environment | length > 0 else omit) }}"
+        # Use credential IDs when available (preferred), else fall back to names
+        credentials: >-
+          {{
+            (
+              item.credential_names | default([]) | reject('equalto','') | reject('equalto', None) |
+              map('extract', _credential_id_map | default({})) | reject('equalto', None) | list
+            )
+            if (_credential_id_map is defined and (item.credential_names | default([]) | reject('equalto','') | reject('equalto', None) | list | length) > 0)
+            else (
+              (item.credential_names | default([]) | reject('equalto','') | reject('equalto', None) | list)
+              if (item.credential_names | default([]) | select('length') | list | length) > 0
+              else ([credential_name] if credential_name | length > 0 else omit)
+            )
+          }}
         survey_enabled: "{{ item.survey_enabled | default(false) }}"
         survey_spec: "{{ item.survey_spec | default(omit) }}"
         ask_variables_on_launch: true
@@ -1081,13 +1483,120 @@
         _jt_successes: "{{ _job_template_results.results | rejectattr('failed') | list }}"
       tags: workflow
 
-    - name: Abort workflow creation due to JT failures
+    - name: Retry job template creation for playbook-not-found failures (project resync fallback)
+      when:
+        - auto_retry_job_template_creation | bool
+        - _jt_failures | length > 0
+        - project_scm_url | length > 0
+      block:
+        - name: Identify retriable failures
+          ansible.builtin.set_fact:
+            _retriable_templates: "{{ _jt_failures | selectattr('msg','defined') | selectattr('msg','search','playbook') | map(attribute='item') | list }}"
+
+        - name: Trigger forced project resync before retry
+          ansible.builtin.uri:
+            url: "{{ controller_host }}{{ _api_base }}/projects/{{ _project_id }}/update/"
+            method: POST
+            status_code: 202
+            return_content: true
+            validate_certs: "{{ controller_verify_ssl }}"
+            headers: "{{ {'Authorization': 'Bearer ' ~ _controller_token} if (_controller_token | length > 0) else omit }}"
+            url_username: "{{ _controller_username if (_controller_token | length == 0) else omit }}"
+            url_password: "{{ _controller_password if (_controller_token | length == 0) else omit }}"
+            force_basic_auth: "{{ true if (_controller_token | length == 0) else omit }}"
+          register: _forced_sync
+          when: _retriable_templates | length > 0
+
+        - name: Wait briefly after forced sync
+          ansible.builtin.pause:
+            seconds: 8
+          when: _retriable_templates | length > 0
+
+        - name: Second-pass creation of retriable job templates
+          ansible.controller.job_template:
+            controller_host: "{{ controller_host }}"
+            controller_oauthtoken: "{{ _controller_token if _controller_token | length > 0 else omit }}"
+            controller_username: "{{ _controller_username if (_controller_token | length == 0 and _controller_username | length > 0) else omit }}"
+            controller_password: "{{ _controller_password if (_controller_token | length == 0 and _controller_password | length > 0) else omit }}"
+            validate_certs: "{{ controller_verify_ssl }}"
+            name: "{{ item.name }}"
+            description: "{{ item.description }}"
+            organization: "{{ organization_name }}"
+            project: "{{ project_name }}"
+            inventory: "{{ inventory_name }}"
+            playbook: "{{ item.playbook }}"
+            job_type: run
+            execution_environment: "{{ _ee_id if (_ee_id is defined and _ee_id is not none) else (execution_environment if execution_environment | length > 0 else omit) }}"
+            credentials: >-
+              {{
+                (
+                  item.credential_names | default([]) | reject('equalto','') | reject('equalto', None) |
+                  map('extract', _credential_id_map | default({})) | reject('equalto', None) | list
+                )
+                if (_credential_id_map is defined and (item.credential_names | default([]) | reject('equalto','') | reject('equalto', None) | list | length) > 0)
+                else (
+                  (item.credential_names | default([]) | reject('equalto','') | reject('equalto', None) | list)
+                  if (item.credential_names | default([]) | select('length') | list | length) > 0
+                  else ([credential_name] if credential_name | length > 0 else omit)
+                )
+              }}
+            survey_enabled: "{{ item.survey_enabled | default(false) }}"
+            survey_spec: "{{ item.survey_spec | default(omit) }}"
+            ask_variables_on_launch: true
+            ask_limit_on_launch: true
+            state: present
+          loop: "{{ _retriable_templates }}"
+          loop_control:
+            label: "{{ item.name }}"
+          register: _jt_retry_results
+          failed_when: false
+          when: _retriable_templates | length > 0
+
+        - name: Combine first-pass and retry results
+          ansible.builtin.set_fact:
+            _job_template_results_combined: "{{ (_job_template_results.results + (_jt_retry_results.results | default([]))) }}"
+          when: _retriable_templates | length > 0
+
+        - name: Recompute failure list after retry
+          ansible.builtin.set_fact:
+            _jt_failures_final: "{{ (_job_template_results_combined | default(_job_template_results.results)) | selectattr('failed') | list }}"
+            _jt_successes_final: "{{ (_job_template_results_combined | default(_job_template_results.results)) | rejectattr('failed') | list }}"
+          when: _retriable_templates | length > 0
+
+    - name: Set final failure/success facts (no retry executed)
+      ansible.builtin.set_fact:
+        _jt_failures_final: "{{ _jt_failures }}"
+        _jt_successes_final: "{{ _jt_successes }}"
+      when: _jt_failures_final is not defined
+      tags: workflow
+
+    - name: Detailed debug for failed job templates (pre-abort)
+      ansible.builtin.debug:
+        msg: |
+          Job template creation failures (raw results):
+          {% for r in (_job_template_results.results + (_jt_retry_results.results | default([]))) %}
+          {% if r.failed | default(false) %}
+          ---
+          Name: {{ r.item.name }}
+          Playbook: {{ r.item.playbook }}
+          Requested credential names: {{ r.item.credential_names | default([]) }}
+          Credentials argument sent: {{ r.invocation.module_args.credentials | default('n/a') }}
+          Message: {{ r.msg | default('no msg') }}
+          Exception: {{ r.exception | default('n/a') }}
+          Changed: {{ r.changed | default(false) }}
+          Raw keys: {{ r.keys() | list }}
+          {% endif %}
+          {% endfor %}
+      when: _jt_failures_final | length > 0
+      tags: workflow
+
+    - name: Abort workflow creation due to JT failures (after retry if enabled)
       ansible.builtin.fail:
         msg: |
           One or more job templates failed to create. Workflow will not be built.
 
           Failures:
-          {% for r in _jt_failures %}
+          {% for r in _jt_failures_final %}
           - {{ r.item.name }}: {{ r.msg | default('Unknown error') }}
           {% endfor %}
 
@@ -1095,7 +1604,7 @@
           - Ensure Project '{{ project_name }}' is synced and contains playbook: {{ r.item.playbook | default('') }}
           - Ensure Inventory '{{ inventory_name }}' exists
           - Provide execution_environment / credentials if required by Controller policies
-      when: _jt_failures | length > 0
+      when: _jt_failures_final | length > 0
       tags: workflow
 
     - name: Determine required job templates availability

@@ -1,38 +1,19 @@
 ---
-# Playbook: create_satellite_post_template.yml
-# Synopsis: Builds enhanced RHEL 9.7 post-kickstart provisioning template by cloning default header and injecting parameterized %post with aggregated public SSH keys.
-# Purpose: Create a new RHEL 9.7 post-kickstart provisioning template on Satellite
-#          by copying the header of the existing default kickstart template and
-#          injecting an enhanced %post section sourced from kickstart_post_section.j2,
-#          including aggregated SSH public keys from foreman/root/admin.
-#
-# Security: Only public keys (.pub) are used. If id_rsa exists without id_rsa.pub,
-#           the public key is derived (ssh-keygen -y). Private keys never copied.
-#
-# Resulting remote file:
-#   /usr/share/foreman/app/views/unattended/provisioning_templates/provision/RHEL_9.7_x86_64_kickstart_post_default.erb
-#
-# Variables (override with -e):
-#   sat_host (default satellite.prod.spg)
-#   sat_existing_template_path
-#   sat_new_template_path
-#   admin_user (default admin)
-#   admin_password (default r3dh4t7!)
-#   force_password_change (default true)
-#   activation_keys (e.g. "9:RHEL9-AK")
-#   ks_enable_updates (default false)
-#   ks_firewall_services (default ssh,http,https)
-#   satellite_ip (default 10.168.151.127)
-#   satellite_fqdn (default satellite.prod.spg)
-#
-# Usage:
-#   ansible-playbook -i inventory create_satellite_post_template.yml \
-#     -e activation_keys='8:RHEL8-AK,9:RHEL9-AK' -e ks_enable_updates=true
+### Playbook: create_satellite_post_template.yml
+# Consolidated fixed version.
+# Issues fixed:
+#  - Removed duplicate second play (previous file contained two plays).
+#  - Enabled fact gathering OR provided timestamp without relying on ansible_date_time when gather_facts was false.
+#  - Replaced ansible_date_time usage with a portable timestamp command.
+#  - Simplified public key collection logic (single pass with derivation + re-scan).
+#  - Cleaned up heredoc / password hashing section for reliability.
+#  - Added explicit satellite_ip / satellite_fqdn variables to avoid hostvars indirection.
+#  - Ensured backup operation does not fail when facts are disabled.
 
 - name: Create enhanced Kickstart post template on Satellite
   hosts: "{{ sat_host | default('satellite.prod.spg') }}"
   become: true
-  gather_facts: false
+  gather_facts: true
 
   vars:
     sat_existing_template_path: "/usr/share/foreman/app/views/unattended/provisioning_templates/provision/RHEL_9.7_x86_64_kickstart_default.erb"
@@ -49,133 +30,7 @@
       - /var/lib/foreman/.ssh
       - /root/.ssh
       - "/home/{{ admin_user }}/.ssh"
-
-  tasks:
-    - name: Check base template exists
-      ansible.builtin.stat:
-        path: "{{ sat_existing_template_path }}"
-      register: _base_stat
-
-    - name: Fail if base template missing
-      ansible.builtin.fail:
-        msg: "Base template not found at {{ sat_existing_template_path }}"
-      when: not _base_stat.stat.exists
-
-    - name: Read base template
-      ansible.builtin.slurp:
-        path: "{{ sat_existing_template_path }}"
-      register: _base_raw
-
-    - name: Decode base template
-      ansible.builtin.set_fact:
-        _base_template_content: "{{ _base_raw.content | b64decode }}"
-
-    - name: Stat SSH key directories
-      ansible.builtin.stat:
-        path: "{{ item }}"
-      loop: "{{ ssh_key_source_dirs }}"
-      register: _key_dirs
-      failed_when: false
-
-    - name: Derive missing public keys (id_rsa -> id_rsa.pub)
-      ansible.builtin.shell: |
-        set -e
-        d="{{ item.path }}"
-        [ -d "$d" ] || exit 0
-        if [ -f "$d/id_rsa" ] && [ ! -f "$d/id_rsa.pub" ]; then
-          ssh-keygen -y -f "$d/id_rsa" > "$d/id_rsa.pub" || exit 1
-        fi
-      args:
-        executable: /bin/bash
-      loop: "{{ _key_dirs.results }}"
-      changed_when: false
-      failed_when: false
-
-    - name: Gather .pub files
-      ansible.builtin.find:
-        paths: "{{ item.path }}"
-        patterns: "*.pub"
-        file_type: file
-      loop: "{{ _key_dirs.results }}"
-      register: _pub_files
-      failed_when: false
-
-    - name: Read public key contents
-      ansible.builtin.slurp:
-        path: "{{ item.path }}"
-      loop: "{{ _pub_files.results | map(attribute='files') | flatten | default([]) }}"
-      register: _pub_contents
-      failed_when: false
-
-    - name: Aggregate unique public keys
-      ansible.builtin.set_fact:
-        _all_public_keys: "{{ _pub_contents.results | map(attribute='content') | map('b64decode') | list | unique }}"
-
-    - name: Build enhanced %post section from template file
-      ansible.builtin.set_fact:
-        _post_section: "{{ lookup('template','node_provisioning/templates/kickstart_post_section.j2') }}"
-
-    - name: Backup existing target if present
-      ansible.builtin.stat:
-        path: "{{ sat_new_template_path }}"
-      register: _new_stat
-
-    - name: Backup file
-      ansible.builtin.copy:
-        src: "{{ sat_new_template_path }}"
-        dest: "{{ sat_new_template_path }}.bak_{{ ansible_date_time.iso8601_basic }}"
-        remote_src: true
-      when: _new_stat.stat.exists
-
-    - name: Assemble new template content (header + post)
-      ansible.builtin.set_fact:
-        _new_template_content: "{{ _base_template_content.split('%post')[0] | trim }}\n{{ _post_section }}"
-
-    - name: Write new template file
-      ansible.builtin.copy:
-        content: "{{ _new_template_content }}"
-        dest: "{{ sat_new_template_path }}"
-        owner: root
-        group: root
-        mode: '0644'
-
-    - name: Summary
-      ansible.builtin.debug:
-        msg: |
-          New template written: {{ sat_new_template_path }}
-          Public keys included: {{ _all_public_keys | length }}
-          Admin user: {{ admin_user }} (force change: {{ force_password_change }})
-          Activation keys mapping: {{ activation_keys }}
-          Updates enabled: {{ ks_enable_updates }}
-          Backup performed: {{ _new_stat.stat.exists | ternary('yes','no') }}
-  # End of play
-#
-# REQUIREMENTS:
-#   - Inventory entry for Satellite host (satellite.prod.spg) with become privileges.
-#   - Python on remote.
-#
-# SAFETY:
-#   - Backs up existing target file if present (.bak timestamp suffix).
-#   - Idempotent: recreates only if content differs.
-#
-- name: Create enhanced Kickstart post template on Satellite
-  hosts: "{{ sat_host | default('satellite.prod.spg') }}"
-  become: true
-  gather_facts: false
-
-  vars:
-    sat_existing_template_path: "/usr/share/foreman/app/views/unattended/provisioning_templates/provision/RHEL_9.7_x86_64_kickstart_default.erb"
-    sat_new_template_path: "/usr/share/foreman/app/views/unattended/provisioning_templates/provision/RHEL_9.7_x86_64_kickstart_post_default.erb"
-    admin_user: "{{ admin_user | default('admin') }}"
-    admin_password: "{{ admin_password | default('r3dh4t7!') }}"
-    force_password_change: "{{ force_password_change | default(true) }}"
-    activation_keys: "{{ activation_keys | default('9:RHEL9-AK') }}"
-    ks_enable_updates: "{{ ks_enable_updates | default(false) }}"
-    ks_firewall_services: "{{ ks_firewall_services | default('ssh,http,https') }}"
-    ssh_key_source_dirs:
-      - /var/lib/foreman/.ssh
-      - /root/.ssh
-      - "/home/{{ admin_user }}/.ssh"
+    _timestamp: "{{ lookup('pipe','date +%Y%m%d%H%M%S') }}"
 
   tasks:
     - name: Verify existing base template path
@@ -204,52 +59,27 @@
       register: _key_dirs
       failed_when: false
 
-    - name: Find existing public keys (.pub)
-      ansible.builtin.find:
-        paths: "{{ item.item.path }}"
-        patterns: "*.pub"
-        file_type: file
-      loop: "{{ _key_dirs.results | selectattr('stat.exists','equalto',True) | list }}"
-      register: _pub_key_files
-      failed_when: false
-      when: item.stat.exists
-
-    - name: Derive missing public keys from private id_rsa if needed
+    - name: Derive and collect public keys (single pass)
       ansible.builtin.shell: |
         set -e
-        priv="{{ item.item.path }}/id_rsa"
-        pub="{{ item.item.path }}/id_rsa.pub"
+        d="{{ item.path }}"
+        [ -d "$d" ] || exit 0
+        priv="$d/id_rsa"
+        pub="$d/id_rsa.pub"
         if [ -f "$priv" ] && [ ! -f "$pub" ]; then
-          ssh-keygen -y -f "$priv" > "$pub" || exit 1
+          ssh-keygen -y -f "$priv" > "$pub" || true
         fi
+        find "$d" -maxdepth 1 -type f -name '*.pub' -exec cat {} + 2>/dev/null || true
       args:
         executable: /bin/bash
-      loop: "{{ _key_dirs.results | selectattr('stat.exists','equalto',True) | list }}"
-      register: _derived_keys
-      changed_when: "'id_rsa.pub' in result.stdout or 'id_rsa.pub' in result.stderr"
-      failed_when: false
-      when: item.stat.exists
-
-    - name: Re-scan public keys after derivation
-      ansible.builtin.find:
-        paths: "{{ item.item.path }}"
-        patterns: "*.pub"
-        file_type: file
-      loop: "{{ _key_dirs.results | selectattr('stat.exists','equalto',True) | list }}"
-      register: _pub_key_files_final
-      failed_when: false
-      when: item.stat.exists
-
-    - name: Read public key contents
-      ansible.builtin.slurp:
-        path: "{{ item.path }}"
-      loop: "{{ _pub_key_files_final.results | map(attribute='files') | flatten | default([]) }}"
-      register: _pub_keys_contents
+      loop: "{{ _key_dirs.results }}"
+      register: _pub_cat
+      changed_when: false
       failed_when: false
 
     - name: Build unique public key list
       ansible.builtin.set_fact:
-        _all_public_keys: "{{ _pub_keys_contents.results | map(attribute='content') | map('b64decode') | list | unique }}"
+        _all_public_keys: "{{ _pub_cat.results | map(attribute='stdout') | join('\n') | split('\n') | map('trim') | reject('equalto','') | list | unique }}"
 
     - name: Prepare activation key map
       ansible.builtin.set_fact:
@@ -257,96 +87,7 @@
 
     - name: Build enhanced %post section
       ansible.builtin.set_fact:
-        _post_section: |
-          %post --log=/root/ks-post.log
-          set -euo pipefail
-          log() { echo "[POST] $(date +%F_%T) $*" | tee -a /root/post-install-summary.txt; }
-          warn() { echo "[POST][WARN] $(date +%F_%T) $*" | tee -a /root/post-install-summary.txt; }
-          err()  { echo "[POST][ERROR] $(date +%F_%T) $*" | tee -a /root/post-install-summary.txt; }
-          ADMIN_USER={{ admin_user }}
-          ADMIN_PASS_PLAIN='{{ admin_password }}'
-          FORCE_CHANGE={{ 'true' if force_password_change | bool else 'false' }}
-          FIREWALL_SERVICES='{{ ks_firewall_services }}'
-          ACTIVATION_KEYS='{{ activation_keys }}'
-          OS_MAJOR=$(grep -oE 'release ([0-9]+)' /etc/redhat-release | awk '{print $2}')
-          AK_USED=$(echo "$ACTIVATION_KEYS" | tr ',' '\n' | awk -F: -v M="$OS_MAJOR" '$1==M {print $2}')
-          sleep 5
-          log "Starting post-install on $(hostname) (OS_MAJOR=$OS_MAJOR)"
-          # Admin user creation & password hashing
-          if id "$ADMIN_USER" >/dev/null 2>&1; then
-            log "User $ADMIN_USER exists"
-          else
-            useradd -m -s /bin/bash "$ADMIN_USER" || err "Failed useradd"
-          fi
-          if command -v openssl >/dev/null 2>&1; then HASH=$(openssl passwd -6 "$ADMIN_PASS_PLAIN"); else HASH=$(python3 - <<'PY'
-          import crypt,sys;print(crypt.crypt(sys.argv[1], crypt.mksalt(crypt.METHOD_SHA512)))
-PY
-          "$ADMIN_PASS_PLAIN"); fi
-          usermod -p "$HASH" "$ADMIN_USER" || warn "Password set failed"
-          if [ "$FORCE_CHANGE" = "true" ]; then chage -d 0 "$ADMIN_USER" || warn "chage failed"; fi
-          grep -q "^$ADMIN_USER " /etc/sudoers || echo "$ADMIN_USER ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
-          # SSH adjustments
-          if grep -q '^PermitRootLogin' /etc/ssh/sshd_config; then sed -i 's/^PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config; else echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config; fi
-          systemctl restart sshd || warn "sshd restart failed"
-          # Generate admin key if absent
-          ADMIN_HOME=$(getent passwd "$ADMIN_USER" | cut -d: -f6)
-          if [ -n "$ADMIN_HOME" ]; then
-            mkdir -p "$ADMIN_HOME/.ssh" && chmod 700 "$ADMIN_HOME/.ssh"
-            if [ ! -f "$ADMIN_HOME/.ssh/id_rsa" ]; then sudo -u "$ADMIN_USER" ssh-keygen -t rsa -b 4096 -N '' -f "$ADMIN_HOME/.ssh/id_rsa" -C "$ADMIN_USER@$(hostname)" || warn "admin keygen failed"; fi
-          fi
-          # Inject collected public keys
-          ROOT_AUTH=/root/.ssh/authorized_keys
-          mkdir -p /root/.ssh && chmod 700 /root/.ssh
-          touch "$ROOT_AUTH" && chmod 600 "$ROOT_AUTH"
-          if [ -n "$ADMIN_HOME" ]; then touch "$ADMIN_HOME/.ssh/authorized_keys" && chmod 600 "$ADMIN_HOME/.ssh/authorized_keys"; fi
-          cat > /tmp/all_keys.txt <<'KEYS'
-          {{ _all_public_keys | join('\n') }}
-KEYS
-          while read -r K; do
-            [ -z "$K" ] && continue
-            grep -qxF "$K" "$ROOT_AUTH" || echo "$K" >> "$ROOT_AUTH"
-            if [ -n "$ADMIN_HOME" ]; then grep -qxF "$K" "$ADMIN_HOME/.ssh/authorized_keys" || echo "$K" >> "$ADMIN_HOME/.ssh/authorized_keys"; fi
-          done < /tmp/all_keys.txt
-          rm -f /tmp/all_keys.txt
-          # Satellite registration
-          if command -v subscription-manager >/dev/null 2>&1; then
-            if ! subscription-manager identity >/dev/null 2>&1; then
-              if [ -n "$AK_USED" ]; then
-                rpm -Uvh --nodigest --nofiledigest --replacepkgs http://{{ hostvars[inventory_hostname].get('satellite_ip','10.168.151.127') }}/pub/katello-ca-consumer-{{ hostvars[inventory_hostname].get('satellite_fqdn','satellite.prod.spg') }}-1.0-1.noarch.rpm || warn "CA RPM failed"
-                subscription-manager register --org=Default_Organization --activationkey="$AK_USED" || warn "Registration failed"
-              else
-                warn "No activation key mapped for OS_MAJOR=$OS_MAJOR"
-              fi
-            else
-              log "Already registered"
-            fi
-          else
-            warn "subscription-manager missing"
-          fi
-          if subscription-manager identity >/dev/null 2>&1; then
-            subscription-manager repos --enable "satellite-client-6-for-rhel-$OS_MAJOR-x86_64-rpms" || warn "Repo enable failed"
-            yum -y install katello-agent || warn "katello-agent install failed"
-          fi
-          # Firewall
-          if systemctl status firewalld >/dev/null 2>&1; then
-            systemctl enable --now firewalld || warn "firewalld start failed"
-            IFS=','; for S in $FIREWALL_SERVICES; do firewall-cmd --permanent --add-service="$S" || warn "svc $S"; done
-            firewall-cmd --reload || warn "reload failed"
-          else
-            warn "firewalld not available"
-          fi
-          # Updates
-          if {{ ks_enable_updates | bool | ternary('true','false') }}; then
-            yum -y update || warn "Updates incomplete"
-          else
-            log "Updates skipped"
-          fi
-          log "Post-install complete"
-          log "Admin user: $ADMIN_USER"
-          log "Activation key used: ${AK_USED:-None}"
-          log "Registration: $(subscription-manager identity >/dev/null 2>&1 && echo Registered || echo NotRegistered)"
-          log "Firewall: $(systemctl is-active firewalld 2>/dev/null || echo inactive)"
-          %end
+        _post_section: "{{ lookup('template', playbook_dir + '/templates/kickstart_post_section.j2') }}"
 
     - name: Backup existing target file if present
       ansible.builtin.stat:
@@ -356,7 +97,7 @@ KEYS
     - name: Create backup of existing target template
       ansible.builtin.copy:
         src: "{{ sat_new_template_path }}"
-        dest: "{{ sat_new_template_path }}.bak_{{ ansible_date_time.iso8601_basic }}"
+        dest: "{{ sat_new_template_path }}.bak_{{ _timestamp }}"
         remote_src: true
       when: _new_stat.stat.exists
 
