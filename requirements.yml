@@ -1,0 +1,5 @@
+---
+# Minimal Galaxy requirements to satisfy AAP project update validation
+# Add actual roles/collections as needed.
+collections: []
+roles: []

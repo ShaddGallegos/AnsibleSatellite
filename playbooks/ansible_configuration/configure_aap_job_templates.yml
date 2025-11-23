@@ -11,7 +11,7 @@
   
   vars:
     # Controller connection - can be overridden via extra-vars or controller_vars.yml
-    controller_host: "https://aap-controller.example.com"
+    controller_host: ""
     controller_oauthtoken: ""
     controller_username: ""
     controller_password: ""
@@ -19,91 +19,125 @@
     
     # Organization and project
     organization_name: "Default"
-    project_name: "AnsibleLaunchPad"
+    project_name: "AnsibleSatellite"
     
     # Inventory and credentials
     inventory_name: "Satellite Inventory"
+    # Optional: Global credential (legacy single-credential behavior). Prefer per-template below.
     credential_name: ""
+    # Optional: Per-purpose credentials (recommended)
+    machine_credential_name: ""
+    satellite_api_credential_name: ""
     execution_environment: ""
+
+    # Project source (used only if auto-create requested)
+    project_scm_url: ""
+    project_scm_branch: "main"
+    auto_create_project: false
+    auto_create_inventory: false
+    scm_credential_name: ""
     
     # Retry configuration
     api_retry_count: 3
     api_retry_delay: 5
     
-    # Job templates to create
+    # Workflow configuration
+    workflow_name: "Satellite Provisioning Pipeline"
+    jt_push_name: "Push Provisioning Template"
+    jt_associate_name: "Associate Template to OS"
+    jt_params_name: "Set Foreman Parameters"
+    jt_bulk_name: "Bulk Node Builder"
+    
+    # Job templates to create (aligned to actual playbooks in this repo)
     job_templates:
-      - name: "Build Nodes in Batches"
-        description: "Create multiple batches of 5 nodes each using Satellite Compute hostgroup"
-        playbook: "AnsibleSatellite/playbooks/node_provisioning/build_nodes_in_batches.yml"
+      - name: "Bulk Node Builder"
+        description: "Survey-driven bulk creation of Satellite hosts"
+        playbook: "playbooks/node_provisioning/bulk_node_builder.yml"
         survey_enabled: true
+        credential_names:
+          - "{{ satellite_api_credential_name }}"
         survey_spec:
-          name: "Node Batch Creation Survey"
-          description: "Configure batch node provisioning settings"
+          name: "Bulk Node Builder Survey"
+          description: "Configure node count, naming, and resource settings"
           spec:
-            - question_name: "How many batches to create? (each batch = 5 nodes)"
-              question_description: "Total nodes will be iterations × 5"
+            - question_name: "How many nodes to create?"
               required: true
               type: "integer"
-              variable: "iterations"
+              variable: "node_count"
               min: 1
               max: 100
-              default: 1
+              default: 5
+            - question_name: "Start slot (optional)"
+              required: false
+              type: "integer"
+              variable: "start_slot"
+              min: 1
+              max: 999
             - question_name: "Node name prefix"
-              question_description: "Prefix for node names (e.g., 'node' creates node001, node002, etc.)"
               required: true
               type: "text"
               variable: "node_prefix"
               default: "node"
-            - question_name: "Satellite Organization"
-              required: true
+            - question_name: "Shortname prefix (optional override)"
+              required: false
               type: "text"
-              variable: "org"
-              default: "RedHat"
-            - question_name: "Satellite Location"
-              required: true
-              type: "text"
-              variable: "location"
-              default: "Denver"
-            - question_name: "Satellite Hostgroup"
-              required: true
-              type: "text"
-              variable: "hostgroup"
-              default: "Compute"
-            - question_name: "Delay between nodes (seconds)"
-              required: true
-              type: "integer"
-              variable: "delay_seconds"
-              min: 0
-              max: 3600
-              default: 30
-            - question_name: "Delay between batches (seconds)"
-              required: true
-              type: "integer"
-              variable: "delay_between_batches"
-              min: 0
-              max: 7200
-              default: 60
-      
-      - name: "Create Single PXE Node"
-        description: "Create a single PXE-bootable node in Satellite"
-        playbook: "AnsibleSatellite/playbooks/node_provisioning/create_pxe_node.yml"
-        survey_enabled: true
-        survey_spec:
-          name: "Single Node Creation Survey"
-          description: "Configure single node creation"
-          spec:
-            - question_name: "Node number (001-999)"
-              required: true
-              type: "integer"
-              variable: "node_number"
-              min: 1
-              max: 999
-              default: 1
-            - question_name: "Domain name"
+              variable: "shortname"
+            - question_name: "Domain"
               required: true
               type: "text"
               variable: "domain"
               default: "prod.spg"
+            - question_name: "Sequential mode (extend from highest)"
+              required: true
+              type: "multiplechoice"
+              variable: "sequential_mode"
+              choices: ["true","false"]
+              default: "true"
+            - question_name: "Zero padding (digits)"
+              required: true
+              type: "integer"
+              variable: "number_padding"
+              min: 1
+              max: 6
+              default: 3
+            - question_name: "Build strategy"
+              required: true
+              type: "multiplechoice"
+              variable: "build_strategy"
+              choices: ["linear","free"]
+              default: "linear"
+            - question_name: "Serial batch size (0 = all)"
+              required: true
+              type: "integer"
+              variable: "serial_batch"
+              min: 0
+              max: 500
+              default: 0
+            - question_name: "MAC address prefix"
+              required: true
+              type: "text"
+              variable: "mac_address_prefix"
+              default: "52:54:00:aa:bb"
+            - question_name: "Randomize MAC last octet"
+              required: true
+              type: "multiplechoice"
+              variable: "random_mac"
+              choices: ["true","false"]
+              default: "false"
+            - question_name: "Satellite host (FQDN)"
+              required: true
+              type: "text"
+              variable: "satellite_host"
+              default: "satellite.prod.spg"
+            - question_name: "Satellite user"
+              required: true
+              type: "text"
+              variable: "satellite_user"
+              default: "admin"
+            - question_name: "Satellite password (leave blank to use env cred)"
+              required: false
+              type: "password"
+              variable: "satellite_password"
             - question_name: "Operating System ID"
               required: false
               type: "integer"
@@ -118,68 +152,187 @@
               min: 1
               max: 999
               default: 1
-      
-      - name: "Bulk Create PXE Nodes"
-        description: "Create multiple consecutive PXE nodes with automatic slot allocation"
-        playbook: "AnsibleSatellite/playbooks/node_provisioning/bulk_create_pxe_nodes.yml"
-        survey_enabled: true
-        survey_spec:
-          name: "Bulk Node Creation Survey"
-          description: "Create multiple nodes in consecutive order"
-          spec:
-            - question_name: "How many nodes to create?"
-              required: true
-              type: "integer"
-              variable: "nodes_to_install"
-              min: 1
-              max: 100
-              default: 5
-            - question_name: "Domain name"
-              required: true
-              type: "text"
-              variable: "domain"
-              default: "prod.spg"
-            - question_name: "Maximum scheduled jobs (AAP capacity)"
+            - question_name: "Subnet ID"
               required: false
               type: "integer"
-              variable: "maximum_scheduled_jobs"
-              min: 1
-              max: 100
-              default: 10
-      
-      - name: "Delete PXE Node"
-        description: "Remove a node from Satellite and clean up resources"
-        playbook: "AnsibleSatellite/playbooks/node_provisioning/delete_pxe_node.yml"
-        survey_enabled: true
-        survey_spec:
-          name: "Node Deletion Survey"
-          description: "Select node to delete"
-          spec:
-            - question_name: "Node number to delete (001-999)"
-              required: true
-              type: "integer"
-              variable: "node_number"
+              variable: "subnet_id"
               min: 1
               max: 999
-      
-      - name: "List PXE Nodes"
-        description: "Display all PXE nodes and available slots"
-        playbook: "AnsibleSatellite/playbooks/node_provisioning/list_pxe_nodes.yml"
-        survey_enabled: false
-      
-      - name: "PXE Boot Remediation"
-        description: "Fix PXE boot issues with automatic boot file resolution"
-        playbook: "AnsibleSatellite/playbooks/node_provisioning/pxe_boot_remediate.yml"
+              default: 1
+            - question_name: "Location ID"
+              required: false
+              type: "integer"
+              variable: "location_id"
+              min: 1
+              max: 999
+              default: 2
+            - question_name: "Organization ID"
+              required: false
+              type: "integer"
+              variable: "organization_id"
+              min: 1
+              max: 999
+              default: 1
+            - question_name: "CSV export path (Controller local path)"
+              required: false
+              type: "text"
+              variable: "export_path"
+
+      - name: "Push Provisioning Template"
+        description: "Create or update Foreman/Satellite provisioning template"
+        playbook: "playbooks/node_provisioning/push_provisioning_template.yml"
         survey_enabled: true
+        credential_names:
+          - "{{ satellite_api_credential_name }}"
         survey_spec:
-          name: "PXE Remediation Survey"
-          description: "Specify node and VM details"
+          name: "Provisioning Template Survey"
+          description: "Satellite credentials and template parameters"
           spec:
-            - question_name: "Satellite hostname (FQDN)"
+            - question_name: "Satellite URL"
               required: true
               type: "text"
-              variable: "host_name"
-              default: "node001.prod.spg"
+              variable: "satellite_url"
+              default: "https://satellite.prod.spg"
+            - question_name: "Satellite username"
+              required: true
+              type: "text"
+              variable: "satellite_username"
+              default: "admin"
+            - question_name: "Satellite password (leave blank to use env cred)"
+              required: false
+              type: "password"
+              variable: "satellite_password"
+            - question_name: "Template name"
+              required: true
+              type: "text"
+              variable: "template_name"
+              default: "RHEL 9.7 x86_64 Post-Kickstart Default"
+            - question_name: "Template file path"
+              required: true
+              type: "text"
+              variable: "template_file"
+              default: "playbooks/node_provisioning/templates/RHEL_9.7_x86_64_post_kickstart_default.erb"
+
+      - name: "Associate Template to OS"
+        description: "Associate provisioning template to RHEL OS as default"
+        playbook: "playbooks/node_provisioning/associate_template_to_os.yml"
+        survey_enabled: true
+        credential_names:
+          - "{{ satellite_api_credential_name }}"
+        survey_spec:
+          name: "Associate Template Survey"
+          description: "Satellite credentials and OS version"
+          spec:
+            - question_name: "Satellite URL"
+              required: true
+              type: "text"
+              variable: "satellite_url"
+              default: "https://satellite.prod.spg"
+            - question_name: "Satellite username"
+              required: true
+              type: "text"
+              variable: "satellite_username"
+              default: "admin"
+            - question_name: "Satellite password (leave blank to use env cred)"
+              required: false
+              type: "password"
+              variable: "satellite_password"
+            - question_name: "Template name"
+              required: true
+              type: "text"
+              variable: "template_name"
+              default: "RHEL 9.7 x86_64 Post-Kickstart Default"
+            - question_name: "RHEL major version"
+              required: true
+              type: "integer"
+              variable: "os_major"
+              min: 7
+              max: 10
+              default: 9
+            - question_name: "RHEL minor version"
+              required: true
+              type: "integer"
+              variable: "os_minor"
+              min: 0
+              max: 99
+              default: 7
+
+      - name: "Set Foreman Parameters"
+        description: "Create or update Foreman global parameters for %post logic"
+        playbook: "playbooks/node_provisioning/set_foreman_parameters.yml"
+        survey_enabled: true
+        credential_names:
+          - "{{ satellite_api_credential_name }}"
+        survey_spec:
+          name: "Foreman Parameters Survey"
+          description: "Admin credentials and provisioning flags"
+          spec:
+            - question_name: "Satellite URL"
+              required: true
+              type: "text"
+              variable: "satellite_url"
+              default: "https://satellite.prod.spg"
+            - question_name: "Satellite username"
+              required: true
+              type: "text"
+              variable: "satellite_username"
+              default: "admin"
+            - question_name: "Satellite password (leave blank to use env cred)"
+              required: false
+              type: "password"
+              variable: "satellite_password"
+            - question_name: "Admin user"
+              required: true
+              type: "text"
+              variable: "admin_user"
+              default: "admin"
+            - question_name: "Admin password"
+              required: true
+              type: "password"
+              variable: "admin_password"
+              default: "r3dh4t7!"
+            - question_name: "Activation keys (e.g. 9:RHEL9-AK)"
+              required: true
+              type: "text"
+              variable: "activation_keys"
+              default: "9:RHEL9-AK"
+            - question_name: "Enable package update in %post"
+              required: true
+              type: "multiplechoice"
+              variable: "ks_enable_updates"
+              choices: ["true","false"]
+              default: "true"
+
+      - name: "Verify Post Install Summary"
+        description: "Wait for SSH and verify /root/post-install-summary.txt on new node"
+        playbook: "playbooks/node_provisioning/verify_post_install_summary.yml"
+        survey_enabled: true
+        credential_names:
+          - "{{ machine_credential_name }}"
+        survey_spec:
+          name: "Verify Post Install Survey"
+          description: "Target host and SSH user"
+          spec:
+            - question_name: "Target host (FQDN or IP)"
+              required: true
+              type: "text"
+              variable: "target_host"
+            - question_name: "SSH user"
+              required: true
+              type: "text"
+              variable: "ssh_user"
+              default: "root"
+
+      - name: "PXE Boot Troubleshoot"
+        description: "Diagnostics and fixes for PXE boot issues (requires KVM host inventory)"
+        playbook: "playbooks/node_provisioning/pxe_boot_troubleshoot.yml"
+        survey_enabled: true
+        credential_names:
+          - "{{ machine_credential_name }}"
+        survey_spec:
+          name: "PXE Troubleshoot Survey"
+          description: "VM name and KVM URI"
+          spec:
             - question_name: "Libvirt VM name"
               required: true
               type: "text"
@@ -189,21 +342,151 @@
               type: "text"
               variable: "kvm_uri"
               default: "qemu:///system"
-      
-      - name: "Satellite Health Check"
-        description: "Comprehensive Satellite server health check"
-        playbook: "AnsibleSatellite/playbooks/satellite_configuration/satellite_health_check.yml"
-        survey_enabled: false
-      
-      - name: "Backup Satellite Configuration"
-        description: "Backup Satellite configs, certs, and settings"
-        playbook: "AnsibleSatellite/playbooks/satellite_configuration/satellite_config_backup.yml"
-        survey_enabled: false
-      
+
+      - name: "Satellite Configuration Manager"
+        description: "Compute profiles, defaults discovery, and PXE template fixes"
+        playbook: "playbooks/satellite_configuration/satellite_configuration_manager.yml"
+        survey_enabled: true
+        credential_names:
+          - "{{ satellite_api_credential_name }}"
+        survey_spec:
+          name: "Satellite Config Survey"
+          description: "Select operation and related parameters"
+          spec:
+            - question_name: "Operation"
+              required: true
+              type: "multiplechoice"
+              variable: "operation"
+              choices: ["compute_profiles","discover_defaults","fix_pxe_templates"]
+              default: "compute_profiles"
+            - question_name: "Compute resource ID"
+              required: false
+              type: "integer"
+              variable: "compute_resource_id"
+              min: 1
+              max: 999
+              default: 1
+            - question_name: "PXE bridge"
+              required: false
+              type: "text"
+              variable: "pxe_bridge"
+              default: "virbr1"
+            - question_name: "PXE network"
+              required: false
+              type: "text"
+              variable: "pxe_network"
+              default: "internal"
+            - question_name: "Subnet ID"
+              required: false
+              type: "integer"
+              variable: "subnet_id"
+              min: 1
+              max: 999
+              default: 1
+
+      - name: "Satellite Email Notifications"
+        description: "Configure SMTP relay or send/verify test emails from Satellite"
+        playbook: "playbooks/satellite_configuration/satellite_email_notifications.yml"
+        survey_enabled: true
+        credential_names:
+          - "{{ satellite_api_credential_name }}"
+        survey_spec:
+          name: "Email Notifications Survey"
+          description: "SMTP relay and test controls"
+          spec:
+            - question_name: "Operation"
+              required: true
+              type: "multiplechoice"
+              variable: "operation"
+              choices: ["configure","send","verify"]
+              default: "configure"
+            - question_name: "SMTP relay host"
+              required: true
+              type: "text"
+              variable: "smtp_host"
+              default: "localhost"
+            - question_name: "SMTP relay port"
+              required: true
+              type: "integer"
+              variable: "smtp_port"
+              min: 1
+              max: 65535
+              default: 587
+            - question_name: "SMTP account"
+              required: true
+              type: "text"
+              variable: "smtp_account"
+              default: "admin@prod.spg"
+            - question_name: "SMTP password (leave blank to use env)"
+              required: false
+              type: "password"
+              variable: "smtp_account_password"
+            - question_name: "Use TLS"
+              required: true
+              type: "multiplechoice"
+              variable: "smtp_use_tls"
+              choices: ["true","false"]
+              default: "true"
+            - question_name: "From email"
+              required: false
+              type: "text"
+              variable: "smtp_from_email"
+              default: "admin@prod.spg"
+            - question_name: "Recipient emails (comma-separated)"
+              required: false
+              type: "text"
+              variable: "smtp_to_emails"
+              default: "admin@prod.spg"
+
+      - name: "Satellite Health Monitoring"
+        description: "Run health checks or backup configuration with retention"
+        playbook: "playbooks/satellite_configuration/satellite_health_monitoring.yml"
+        survey_enabled: true
+        credential_names:
+          - "{{ satellite_api_credential_name }}"
+        survey_spec:
+          name: "Health/Backup Survey"
+          description: "Select operation and backup settings"
+          spec:
+            - question_name: "Operation"
+              required: true
+              type: "multiplechoice"
+              variable: "operation"
+              choices: ["health_check","backup"]
+              default: "health_check"
+            - question_name: "Backup root directory"
+              required: false
+              type: "text"
+              variable: "backup_root"
+              default: "/root/satellite-config-backups"
+            - question_name: "Backup retention days"
+              required: false
+              type: "integer"
+              variable: "backup_retention_days"
+              min: 1
+              max: 365
+              default: 30
+
       - name: "Cleanup Orphaned Disks"
-        description: "Remove orphaned VM disk volumes from libvirt"
-        playbook: "AnsibleSatellite/playbooks/libvirt_configuration/cleanup_orphaned_disks.yml"
-        survey_enabled: false
+        description: "Remove orphaned VM libvirt disk volumes"
+        playbook: "playbooks/libvirt_configuration/cleanup_orphaned_disks.yml"
+        survey_enabled: true
+        credential_names:
+          - "{{ machine_credential_name }}"
+        survey_spec:
+          name: "Orphaned Disks Survey"
+          description: "KVM host and domain filter"
+          spec:
+            - question_name: "KVM host (IP or name)"
+              required: true
+              type: "text"
+              variable: "kvm_host"
+              default: "10.168.0.1"
+            - question_name: "Domain name pattern"
+              required: true
+              type: "text"
+              variable: "domain_pattern"
+              default: "prod.spg"
 
   pre_tasks:
     - name: Load controller_vars.yml if it exists
@@ -272,54 +555,6 @@
         success_msg: "Authentication credentials validated"
       tags: always
 
-    - name: Test Controller API connectivity
-      ansible.builtin.uri:
-        url: "{{ controller_host }}/api/controller/v2/ping/"
-        method: GET
-        return_content: true
-        status_code: 200
-        validate_certs: "{{ controller_verify_ssl }}"
-        headers: "{{ {'Authorization': 'Bearer ' ~ _controller_token} if (_controller_token | length > 0) else omit }}"
-        url_username: "{{ _controller_username if (_controller_token | length == 0) else omit }}"
-        url_password: "{{ _controller_password if (_controller_token | length == 0) else omit }}"
-        force_basic_auth: "{{ true if (_controller_token | length == 0) else omit }}"
-      register: _api_ping
-      retries: "{{ api_retry_count }}"
-      delay: "{{ api_retry_delay }}"
-      until: _api_ping.status == 200
-      failed_when: false
-      tags: always
-
-    - name: Handle API connectivity issues
-      block:
-        - name: Display connectivity troubleshooting
-          ansible.builtin.debug:
-            msg: |
-              Failed to connect to AAP Controller API
-              
-              URL: {{ controller_host }}/api/controller/v2/ping/
-              Status: {{ _api_ping.status | default('No response') }}
-              Error: {{ _api_ping.msg | default('Connection failed') }}
-              
-              Troubleshooting:
-              1. Verify controller_host URL is correct
-              2. Check network connectivity: curl -k {{ controller_host }}/api/controller/v2/ping/
-              3. If using self-signed certs, set controller_verify_ssl: false
-              4. Verify AAP services are running
-              5. Check firewall rules allow HTTPS (443)
-
-        - name: Fail with helpful message
-          ansible.builtin.fail:
-            msg: "Cannot proceed without AAP API connectivity. See troubleshooting above."
-      when: _api_ping is failed
-      tags: always
-
-    - name: Display API connectivity success
-      ansible.builtin.debug:
-        msg: "Successfully connected to AAP Controller: {{ controller_host }}"
-      when: _api_ping is succeeded
-      tags: always
-
     - name: Validate required configuration
       ansible.builtin.assert:
         that:
@@ -332,12 +567,463 @@
           Required: controller_host, organization_name, project_name, inventory_name
           
           Provide via:
-          - Extra vars: -e controller_host=https://aap.example.com
-          - controller_vars.yml file
+          - Extra vars: -e controller_host=https://ansible.prod.spg
+          - controller_vars.yml file (copy controller_vars.yml.example)
         success_msg: "Required configuration validated"
       tags: always
 
+    - name: Probe Controller API (controller/v2)
+      ansible.builtin.uri:
+        url: "{{ controller_host }}/api/controller/v2/ping/"
+        method: GET
+        return_content: true
+        status_code: 200
+        validate_certs: "{{ controller_verify_ssl }}"
+        headers: "{{ {'Authorization': 'Bearer ' ~ _controller_token} if (_controller_token | length > 0) else omit }}"
+        url_username: "{{ _controller_username if (_controller_token | length == 0) else omit }}"
+        url_password: "{{ _controller_password if (_controller_token | length == 0) else omit }}"
+        force_basic_auth: "{{ true if (_controller_token | length == 0) else omit }}"
+      register: _api_ping_controller
+      failed_when: false
+      tags: always
+
+    - name: Probe Controller API (gateway automation-controller)
+      ansible.builtin.uri:
+        url: "{{ controller_host }}/api/gateway/v1/automation-controller/v2/ping/"
+        method: GET
+        return_content: true
+        status_code: 200
+        validate_certs: "{{ controller_verify_ssl }}"
+        headers: "{{ {'Authorization': 'Bearer ' ~ _controller_token} if (_controller_token | length > 0) else omit }}"
+        url_username: "{{ _controller_username if (_controller_token | length == 0) else omit }}"
+        url_password: "{{ _controller_password if (_controller_token | length == 0) else omit }}"
+        force_basic_auth: "{{ true if (_controller_token | length == 0) else omit }}"
+      register: _api_ping_gateway_ac
+      failed_when: false
+      tags: always
+
+    - name: Probe Controller API (gateway controller)
+      ansible.builtin.uri:
+        url: "{{ controller_host }}/api/gateway/v1/controller/v2/ping/"
+        method: GET
+        return_content: true
+        status_code: 200
+        validate_certs: "{{ controller_verify_ssl }}"
+        headers: "{{ {'Authorization': 'Bearer ' ~ _controller_token} if (_controller_token | length > 0) else omit }}"
+        url_username: "{{ _controller_username if (_controller_token | length == 0) else omit }}"
+        url_password: "{{ _controller_password if (_controller_token | length == 0) else omit }}"
+        force_basic_auth: "{{ true if (_controller_token | length == 0) else omit }}"
+      register: _api_ping_gateway_controller
+      failed_when: false
+      tags: always
+
+    - name: Probe Controller API (v2)
+      ansible.builtin.uri:
+        url: "{{ controller_host }}/api/v2/ping/"
+        method: GET
+        return_content: true
+        status_code: 200
+        validate_certs: "{{ controller_verify_ssl }}"
+        headers: "{{ {'Authorization': 'Bearer ' ~ _controller_token} if (_controller_token | length > 0) else omit }}"
+        url_username: "{{ _controller_username if (_controller_token | length == 0) else omit }}"
+        url_password: "{{ _controller_password if (_controller_token | length == 0) else omit }}"
+        force_basic_auth: "{{ true if (_controller_token | length == 0) else omit }}"
+      register: _api_ping_v2
+      failed_when: false
+      tags: always
+
+    - name: Decide API base path
+      ansible.builtin.set_fact:
+        _api_base: >-
+          {{
+            '/api/controller/v2' if (_api_ping_controller.status | default(0)) == 200 else
+            (
+              '/api/gateway/v1/automation-controller/v2' if (_api_ping_gateway_ac.status | default(0)) == 200 else
+              (
+                '/api/gateway/v1/controller/v2' if (_api_ping_gateway_controller.status | default(0)) == 200 else
+                (
+                  '/api/v2' if (_api_ping_v2.status | default(0)) == 200 else ''
+                )
+              )
+            )
+          }}
+      tags: always
+
+    - name: Detect SSL certificate verification errors
+      ansible.builtin.set_fact:
+        _ssl_verify_error: >-
+          {{
+            ('CERTIFICATE_VERIFY_FAILED' in (_api_ping_controller.msg | default(''))) or
+            ('CERTIFICATE_VERIFY_FAILED' in (_api_ping_gateway_ac.msg | default(''))) or
+            ('CERTIFICATE_VERIFY_FAILED' in (_api_ping_gateway_controller.msg | default(''))) or
+            ('CERTIFICATE_VERIFY_FAILED' in (_api_ping_v2.msg | default('')))
+          }}
+      tags: always
+
+    - name: Re-probe API endpoints without SSL verification (fallback)
+      when: _api_base | length == 0 and controller_verify_ssl | bool and _ssl_verify_error | bool
+      block:
+        - name: Probe (insecure) Controller API (controller/v2)
+          ansible.builtin.uri:
+            url: "{{ controller_host }}/api/controller/v2/ping/"
+            method: GET
+            return_content: true
+            status_code: 200
+            validate_certs: false
+            headers: "{{ {'Authorization': 'Bearer ' ~ _controller_token} if (_controller_token | length > 0) else omit }}"
+            url_username: "{{ _controller_username if (_controller_token | length == 0) else omit }}"
+            url_password: "{{ _controller_password if (_controller_token | length == 0) else omit }}"
+            force_basic_auth: "{{ true if (_controller_token | length == 0) else omit }}"
+          register: _api_ping_controller_insecure
+          failed_when: false
+
+        - name: Probe (insecure) Controller API (gateway automation-controller)
+          ansible.builtin.uri:
+            url: "{{ controller_host }}/api/gateway/v1/automation-controller/v2/ping/"
+            method: GET
+            return_content: true
+            status_code: 200
+            validate_certs: false
+            headers: "{{ {'Authorization': 'Bearer ' ~ _controller_token} if (_controller_token | length > 0) else omit }}"
+            url_username: "{{ _controller_username if (_controller_token | length == 0) else omit }}"
+            url_password: "{{ _controller_password if (_controller_token | length == 0) else omit }}"
+            force_basic_auth: "{{ true if (_controller_token | length == 0) else omit }}"
+          register: _api_ping_gateway_ac_insecure
+          failed_when: false
+
+        - name: Probe (insecure) Controller API (gateway controller)
+          ansible.builtin.uri:
+            url: "{{ controller_host }}/api/gateway/v1/controller/v2/ping/"
+            method: GET
+            return_content: true
+            status_code: 200
+            validate_certs: false
+            headers: "{{ {'Authorization': 'Bearer ' ~ _controller_token} if (_controller_token | length > 0) else omit }}"
+            url_username: "{{ _controller_username if (_controller_token | length == 0) else omit }}"
+            url_password: "{{ _controller_password if (_controller_token | length == 0) else omit }}"
+            force_basic_auth: "{{ true if (_controller_token | length == 0) else omit }}"
+          register: _api_ping_gateway_controller_insecure
+          failed_when: false
+
+        - name: Probe (insecure) Controller API (v2)
+          ansible.builtin.uri:
+            url: "{{ controller_host }}/api/v2/ping/"
+            method: GET
+            return_content: true
+            status_code: 200
+            validate_certs: false
+            headers: "{{ {'Authorization': 'Bearer ' ~ _controller_token} if (_controller_token | length > 0) else omit }}"
+            url_username: "{{ _controller_username if (_controller_token | length == 0) else omit }}"
+            url_password: "{{ _controller_password if (_controller_token | length == 0) else omit }}"
+            force_basic_auth: "{{ true if (_controller_token | length == 0) else omit }}"
+          register: _api_ping_v2_insecure
+          failed_when: false
+
+        - name: Decide API base path (insecure)
+          ansible.builtin.set_fact:
+            _api_base_insecure: >-
+              {{
+                '/api/controller/v2' if (_api_ping_controller_insecure.status | default(0)) == 200 else
+                (
+                  '/api/gateway/v1/automation-controller/v2' if (_api_ping_gateway_ac_insecure.status | default(0)) == 200 else
+                  (
+                    '/api/gateway/v1/controller/v2' if (_api_ping_gateway_controller_insecure.status | default(0)) == 200 else
+                    (
+                      '/api/v2' if (_api_ping_v2_insecure.status | default(0)) == 200 else ''
+                    )
+                  )
+                )
+              }}
+      tags: always
+
+    - name: Abort with SSL guidance (endpoint reachable only without verification)
+      when:
+        - _api_base | length == 0
+        - _api_base_insecure | default('') | length > 0
+      ansible.builtin.fail:
+        msg: |
+          SSL certificate verification failed, but the Controller endpoint is reachable when SSL verification is disabled.
+
+          Detected working base (insecure): {{ _api_base_insecure }}
+
+          Fix options:
+          1) Re-run with SSL verification disabled (lab/non-prod):
+             -e controller_verify_ssl=false
+
+          2) Install the proper CA chain and keep verification enabled (recommended):
+             - Place your CA bundle on the control node and export REQUESTS_CA_BUNDLE=/path/to/ca-bundle.pem
+             - Or import the enterprise CA into the system trust store
+
+          3) Ensure your reverse proxy includes full certificate chain
+
+          After fixing SSL, re-run this playbook.
+
+    - name: Handle API connectivity issues
+      block:
+        - name: Display connectivity troubleshooting
+          ansible.builtin.debug:
+            msg: |
+              Failed to connect to AAP Controller API
+              
+              Tried URLs:
+              - {{ controller_host }}/api/controller/v2/ping/ -> Status: {{ _api_ping_controller.status | default('No response') }}
+                Error: {{ _api_ping_controller.msg | default('Connection failed') }}
+              - {{ controller_host }}/api/gateway/v1/automation-controller/v2/ping/ -> Status: {{ _api_ping_gateway_ac.status | default('No response') }}
+                Error: {{ _api_ping_gateway_ac.msg | default('Connection failed') }}
+              - {{ controller_host }}/api/gateway/v1/controller/v2/ping/ -> Status: {{ _api_ping_gateway_controller.status | default('No response') }}
+                Error: {{ _api_ping_gateway_controller.msg | default('Connection failed') }}
+              - {{ controller_host }}/api/v2/ping/ -> Status: {{ _api_ping_v2.status | default('No response') }}
+                Error: {{ _api_ping_v2.msg | default('Connection failed') }}
+              
+              Troubleshooting:
+              1. Verify controller_host URL is correct
+              2. Check network connectivity: curl -k {{ controller_host }}/api/v2/ping/ (or /api/controller/v2/ping/)
+              3. If using self-signed certs, set controller_verify_ssl: false
+              4. Verify AAP services are running
+              5. Check firewall rules allow HTTPS (443)
+
+        - name: Fail with helpful message
+          ansible.builtin.fail:
+            msg: "Cannot proceed without AAP API connectivity. See troubleshooting above."
+      when: _api_base | length == 0
+      tags: always
+
+    - name: Display API connectivity success
+      ansible.builtin.debug:
+        msg: "Successfully connected to AAP Controller: {{ controller_host }} (base: {{ _api_base }})"
+      when: _api_base | length > 0
+      tags: always
+
+    # ========================================
+    # Lookup Organization ID (needed for inventory queries)
+    # ========================================
+    - name: Query organization by name
+      ansible.builtin.uri:
+        url: "{{ controller_host }}{{ _api_base }}/organizations/?name={{ organization_name | urlencode }}"
+        method: GET
+        return_content: true
+        status_code: 200
+        validate_certs: "{{ controller_verify_ssl }}"
+        headers: "{{ {'Authorization': 'Bearer ' ~ _controller_token} if (_controller_token | length > 0) else omit }}"
+        url_username: "{{ _controller_username if (_controller_token | length == 0) else omit }}"
+        url_password: "{{ _controller_password if (_controller_token | length == 0) else omit }}"
+        force_basic_auth: "{{ true if (_controller_token | length == 0) else omit }}"
+      register: _org_query
+      tags: setup
+
+    - name: Set organization id fact
+      ansible.builtin.set_fact:
+        _org_id: "{{ (_org_query.json.results | default([])) | first | default({}) | json_query('id') | default(0) }}"
+      tags: setup
+
+    - name: Fail if organization not found
+      ansible.builtin.fail:
+        msg: "Organization '{{ organization_name }}' not found on Controller."
+      when: _org_id | int == 0
+      tags: setup
+
+    # ========================================
+    # Ensure Project Exists (query + optional create)
+    # ========================================
+    - name: Query project existence
+      ansible.builtin.uri:
+        url: "{{ controller_host }}{{ _api_base }}/projects/?name={{ project_name | urlencode }}"
+        method: GET
+        return_content: true
+        status_code: 200
+        validate_certs: "{{ controller_verify_ssl }}"
+        headers: "{{ {'Authorization': 'Bearer ' ~ _controller_token} if (_controller_token | length > 0) else omit }}"
+        url_username: "{{ _controller_username if (_controller_token | length == 0) else omit }}"
+        url_password: "{{ _controller_password if (_controller_token | length == 0) else omit }}"
+        force_basic_auth: "{{ true if (_controller_token | length == 0) else omit }}"
+      register: _project_query
+      tags: setup
+
+    - name: Set project existence fact
+      ansible.builtin.set_fact:
+        _project_exists: "{{ (_project_query.json.results | default([])) | length > 0 }}"
+      tags: setup
+
+    - name: Create project (SCM) if missing and auto_create enabled
+      block:
+        - name: Primary project creation (git)
+          ansible.controller.project:
+            controller_host: "{{ controller_host }}"
+            controller_oauthtoken: "{{ _controller_token if _controller_token | length > 0 else omit }}"
+            controller_username: "{{ _controller_username if (_controller_token | length == 0 and _controller_username | length > 0) else omit }}"
+            controller_password: "{{ _controller_password if (_controller_token | length == 0 and _controller_password | length > 0) else omit }}"
+            validate_certs: "{{ controller_verify_ssl }}"
+            name: "{{ project_name }}"
+            organization: "{{ organization_name }}"
+            scm_type: git
+            scm_url: "{{ project_scm_url }}"
+            scm_branch: "{{ project_scm_branch }}"
+            scm_update_on_launch: true
+            scm_credential: "{{ scm_credential_name if scm_credential_name | length > 0 else omit }}"
+            state: present
+          register: _project_create
+          when: project_scm_url | length > 0
+
+        - name: Fallback project creation (manual, no SCM)
+          ansible.controller.project:
+            controller_host: "{{ controller_host }}"
+            controller_oauthtoken: "{{ _controller_token if _controller_token | length > 0 else omit }}"
+            controller_username: "{{ _controller_username if (_controller_token | length == 0 and _controller_username | length > 0) else omit }}"
+            controller_password: "{{ _controller_password if (_controller_token | length == 0 and _controller_password | length > 0) else omit }}"
+            validate_certs: "{{ controller_verify_ssl }}"
+            name: "{{ project_name }}"
+            organization: "{{ organization_name }}"
+            scm_type: manual
+            state: present
+          register: _project_create_manual
+          when: project_scm_url | length == 0
+      rescue:
+        - name: Capture project creation failure details
+          ansible.builtin.debug:
+            msg: |
+              Project creation (git) failed.
+              URL: {{ project_scm_url }} Branch: {{ project_scm_branch }}
+              Error: {{ _project_create.msg | default('No message') }}
+              Attempting manual project fallback...
+          when: project_scm_url | length > 0
+        - name: Manual fallback after git failure
+          ansible.controller.project:
+            controller_host: "{{ controller_host }}"
+            controller_oauthtoken: "{{ _controller_token if _controller_token | length > 0 else omit }}"
+            controller_username: "{{ _controller_username if (_controller_token | length == 0 and _controller_username | length > 0) else omit }}"
+            controller_password: "{{ _controller_password if (_controller_token | length == 0 and _controller_password | length > 0) else omit }}"
+            validate_certs: "{{ controller_verify_ssl }}"
+            name: "{{ project_name }}"
+            organization: "{{ organization_name }}"
+            scm_type: manual
+            state: present
+          register: _project_create_manual_rescue
+      when:
+        - not _project_exists
+        - auto_create_project
+      tags: setup
+
+    - name: Warn if project missing and not auto-created
+      ansible.builtin.debug:
+        msg: |
+          Project '{{ project_name }}' not found and auto_create_project=false.
+          Either create the Project manually in Controller pointing to the repo with playbooks,
+          or re-run with -e auto_create_project=true -e project_scm_url=<git_url>.
+      when:
+        - not _project_exists
+        - not auto_create_project
+      tags: setup
+
+    - name: Force fail if project still missing
+      ansible.builtin.fail:
+        msg: "Project '{{ project_name }}' required for job template creation but does not exist."
+      when:
+        - not _project_exists
+        - (not auto_create_project) or (auto_create_project and (project_scm_url | length == 0))
+      tags: setup
+
+    # ========================================
+    # Ensure Inventory Exists (query + optional create)
+    # ========================================
+    - name: Query inventory existence
+      ansible.builtin.uri:
+        url: "{{ controller_host }}{{ _api_base }}/inventories/?name={{ inventory_name | urlencode }}&organization={{ _org_id }}"
+        method: GET
+        return_content: true
+        status_code: 200
+        validate_certs: "{{ controller_verify_ssl }}"
+        headers: "{{ {'Authorization': 'Bearer ' ~ _controller_token} if (_controller_token | length > 0) else omit }}"
+        url_username: "{{ _controller_username if (_controller_token | length == 0) else omit }}"
+        url_password: "{{ _controller_password if (_controller_token | length == 0) else omit }}"
+        force_basic_auth: "{{ true if (_controller_token | length == 0) else omit }}"
+      register: _inventory_query
+      tags: setup
+
+    - name: Set inventory existence fact
+      ansible.builtin.set_fact:
+        _inventory_exists: "{{ (_inventory_query.json.results | default([])) | length > 0 }}"
+      tags: setup
+
+    - name: Create inventory if missing and auto_create enabled
+      ansible.controller.inventory:
+        controller_host: "{{ controller_host }}"
+        controller_oauthtoken: "{{ _controller_token if _controller_token | length > 0 else omit }}"
+        controller_username: "{{ _controller_username if (_controller_token | length == 0 and _controller_username | length > 0) else omit }}"
+        controller_password: "{{ _controller_password if (_controller_token | length == 0 and _controller_password | length > 0) else omit }}"
+        validate_certs: "{{ controller_verify_ssl }}"
+        name: "{{ inventory_name }}"
+        organization: "{{ organization_name }}"
+        description: "Auto-created inventory for AnsibleSatellite templates"
+        state: present
+      when:
+        - not _inventory_exists
+        - auto_create_inventory
+      register: _inventory_create
+      tags: setup
+
+    - name: Warn if inventory missing and not auto-created
+      ansible.builtin.debug:
+        msg: |
+          Inventory '{{ inventory_name }}' not found and auto_create_inventory=false.
+          Either create the Inventory manually in Controller or re-run with -e auto_create_inventory=true.
+      when:
+        - not _inventory_exists
+        - not auto_create_inventory
+      tags: setup
+
+    - name: Force fail if inventory still missing
+      ansible.builtin.fail:
+        msg: "Inventory '{{ inventory_name }}' required for job template creation but does not exist."
+      when:
+        - not _inventory_exists
+        - not auto_create_inventory
+      tags: setup
+
   tasks:
+    - name: Derive project id (from query or creation)
+      ansible.builtin.set_fact:
+        _project_id: >-
+          {{
+            (_project_query.json.results | default([])) | first | default({}) | json_query('id')
+            | default(
+              _project_create.id | default(
+                _project_create_manual.id | default(
+                  _project_create_manual_rescue.id | default(None)
+                )
+              )
+            )
+          }}
+      when: _project_exists or auto_create_project
+      tags: setup
+
+    - name: Trigger project sync (SCM) to ensure latest playbooks
+      ansible.builtin.uri:
+        url: "{{ controller_host }}{{ _api_base }}/projects/{{ _project_id }}/update/"
+        method: POST
+        status_code: 202
+        return_content: true
+        validate_certs: "{{ controller_verify_ssl }}"
+        headers: "{{ {'Authorization': 'Bearer ' ~ _controller_token} if (_controller_token | length > 0) else omit }}"
+        url_username: "{{ _controller_username if (_controller_token | length == 0) else omit }}"
+        url_password: "{{ _controller_password if (_controller_token | length == 0) else omit }}"
+        force_basic_auth: "{{ true if (_controller_token | length == 0) else omit }}"
+      register: _project_sync
+      failed_when: false
+      when:
+        - _project_id is defined
+        - _project_id is not none
+        - project_scm_url | length > 0
+      tags: setup
+
+    - name: Pause briefly to allow project sync kickoff
+      ansible.builtin.pause:
+        seconds: 5
+      when:
+        - _project_id is defined
+        - _project_id is not none
+        - project_scm_url | length > 0
+      tags: setup
+
     - name: Ensure ansible.controller collection is available
       block:
         - name: Check for ansible.controller collection
@@ -376,7 +1062,6 @@
         inventory: "{{ inventory_name }}"
         playbook: "{{ item.playbook }}"
         job_type: run
-        credentials: "{{ [credential_name] if credential_name | length > 0 else omit }}"
         execution_environment: "{{ execution_environment if execution_environment | length > 0 else omit }}"
         survey_enabled: "{{ item.survey_enabled | default(false) }}"
         survey_spec: "{{ item.survey_spec | default(omit) }}"
@@ -389,6 +1074,350 @@
       register: _job_template_results
       failed_when: false
       tags: job_templates
+
+    - name: Evaluate job template creation success
+      ansible.builtin.set_fact:
+        _jt_failures: "{{ _job_template_results.results | selectattr('failed') | list }}"
+        _jt_successes: "{{ _job_template_results.results | rejectattr('failed') | list }}"
+      tags: workflow
+
+    - name: Abort workflow creation due to JT failures
+      ansible.builtin.fail:
+        msg: |
+          One or more job templates failed to create. Workflow will not be built.
+
+          Failures:
+          {% for r in _jt_failures %}
+          - {{ r.item.name }}: {{ r.msg | default('Unknown error') }}
+          {% endfor %}
+
+          Hints:
+          - Ensure Project '{{ project_name }}' is synced and contains playbook: {{ r.item.playbook | default('') }}
+          - Ensure Inventory '{{ inventory_name }}' exists
+          - Provide execution_environment / credentials if required by Controller policies
+      when: _jt_failures | length > 0
+      tags: workflow
+
+    - name: Determine required job templates availability
+      ansible.builtin.set_fact:
+        _required_jt_names: ["{{ jt_push_name }}", "{{ jt_associate_name }}", "{{ jt_params_name }}", "{{ jt_bulk_name }}"]
+        _jt_status_map: |
+          {% set m = {} %}
+          {% for r in _job_template_results.results %}
+          {%   set _ = m.update({ r.item.name: { 'failed': r.failed | default(false), 'msg': r.msg | default(''), 'changed': r.changed | default(false) } }) %}
+          {% endfor %}
+          {{ m }}
+      tags: workflow
+
+    - name: List missing or failed required job templates
+      ansible.builtin.debug:
+        msg: |
+          The following required job templates are missing or failed to create:
+          {% for n in _required_jt_names %}
+          {%   if (_jt_status_map.get(n) is not defined) or (_jt_status_map.get(n).failed | default(false)) %}
+          - {{ n }}{% if _jt_status_map.get(n) is defined and _jt_status_map.get(n).msg %}: {{ _jt_status_map.get(n).msg }}{% endif %}
+          {%   endif %}
+          {% endfor %}
+      when: _required_jt_names | select('in', _jt_status_map.keys() | list) | list | length < _required_jt_names | length
+            or (_required_jt_names | select('equalto', None) | list | length > 0)
+            or (_required_jt_names | select('in', _jt_status_map.keys() | list) | map('extract', _jt_status_map) | selectattr('failed') | list | length > 0)
+      tags: workflow
+
+    - name: Assert required job templates exist before creating workflow nodes
+      ansible.builtin.assert:
+        that:
+          - (_required_jt_names | difference(_jt_status_map.keys() | list)) | length == 0
+          - (_required_jt_names | map('extract', _jt_status_map) | selectattr('failed') | list | length) == 0
+        fail_msg: |
+          One or more required job templates were not created successfully. 
+          Ensure the Controller Project ({{ project_name }}) and Inventory ({{ inventory_name }}) exist and are accessible.
+
+          Missing or failed templates (name → message):
+          {% for n in _required_jt_names %}
+          {%   if (_jt_status_map.get(n) is not defined) or (_jt_status_map.get(n).failed | default(false)) %}
+          - {{ n }}{% if _jt_status_map.get(n) is defined and _jt_status_map.get(n).msg %}: {{ _jt_status_map.get(n).msg }}{% endif %}
+          {%   endif %}
+          {% endfor %}
+
+          Hints:
+          - Confirm Project "{{ project_name }}" exists and points to this repo, with the correct default branch.
+          - Confirm Inventory "{{ inventory_name }}" exists.
+          - If job template creation failed due to credentials or EE, set credential_name/execution_environment variables.
+      tags: workflow
+
+    # ========================================
+    # Build Job Template ID map directly from creation results
+    # Fallback: query API only for missing IDs
+    # ========================================
+    - name: Build initial JT ID map from creation results
+      ansible.builtin.set_fact:
+        _jt_id_map: |
+          {% set m = {} %}
+          {% for r in _job_template_results.results %}
+          {%   if r.item.name in _required_jt_names %}
+          {%     set id = r.id | default(r.job_template.id | default(None)) %}
+          {%     set _ = m.update({ r.item.name: id }) %}
+          {%   endif %}
+          {% endfor %}
+          {{ m }}
+      tags: workflow
+
+    - name: Determine missing JT IDs after creation
+      ansible.builtin.set_fact:
+        _missing_jt_ids: "{{ _required_jt_names | difference(_jt_id_map.keys() | list) + (_jt_id_map | dict2items | selectattr('value','equalto', None) | map(attribute='key') | list) }}"
+      tags: workflow
+
+    - name: Query missing Job Template IDs (fallback API lookup)
+      ansible.builtin.uri:
+        url: "{{ controller_host }}{{ _api_base }}/job_templates/?name={{ item | urlencode }}&organization={{ _org_id }}"
+        method: GET
+        return_content: true
+        status_code: 200
+        validate_certs: "{{ controller_verify_ssl }}"
+        headers: "{{ {'Authorization': 'Bearer ' ~ _controller_token, 'Content-Type': 'application/json'} if (_controller_token | length > 0) else omit }}"
+        url_username: "{{ _controller_username if (_controller_token | length == 0) else omit }}"
+        url_password: "{{ _controller_password if (_controller_token | length == 0) else omit }}"
+        force_basic_auth: "{{ true if (_controller_token | length == 0) else omit }}"
+      loop: "{{ _missing_jt_ids }}"
+      loop_control:
+        label: "{{ item }}"
+      register: _jt_id_queries_fallback
+      when: _missing_jt_ids | length > 0
+      tags: workflow
+
+    - name: Merge fallback JT IDs into map
+      ansible.builtin.set_fact:
+        _jt_id_map: |
+          {% set m = _jt_id_map.copy() %}
+          {% for r in _jt_id_queries_fallback.results | default([]) %}
+          {%   set id = (r.json.results | default([])) | first | default({}) | json_query('id') | default(None) %}
+          {%   set _ = m.update({ r.item: id }) %}
+          {% endfor %}
+          {{ m }}
+      when: _missing_jt_ids | length > 0
+      tags: workflow
+
+    - name: Assert JT IDs resolved (post-fallback)
+      ansible.builtin.assert:
+        that:
+          - (_required_jt_names | difference(_jt_id_map.keys() | list)) | length == 0
+          - (_jt_id_map.values() | select('equalto', None) | list | length) == 0
+        fail_msg: |
+          Failed to resolve one or more Job Template IDs.
+          Missing IDs for:
+          {% for n in _required_jt_names %}
+          {%   if (_jt_id_map.get(n) is not defined) or (_jt_id_map.get(n) is none) %}
+          - {{ n }}
+          {%   endif %}
+          {% endfor %}
+          Investigate Project sync or playbook path accuracy.
+      tags: workflow
+
+    # ========================================
+    # Create/Update Workflow Job Template
+    # ========================================
+    - name: Create/Update workflow job template (skeleton)
+      ansible.controller.workflow_job_template:
+        controller_host: "{{ controller_host }}"
+        controller_oauthtoken: "{{ _controller_token if _controller_token | length > 0 else omit }}"
+        controller_username: "{{ _controller_username if (_controller_token | length == 0 and _controller_username | length > 0) else omit }}"
+        controller_password: "{{ _controller_password if (_controller_token | length == 0 and _controller_password | length > 0) else omit }}"
+        validate_certs: "{{ controller_verify_ssl }}"
+        name: "{{ workflow_name }}"
+        organization: "{{ organization_name }}"
+        ask_variables_on_launch: true
+        survey_enabled: true
+        survey_spec:
+          name: "Provisioning Pipeline Survey"
+          description: "Shared parameters for all steps"
+          spec:
+            - question_name: "Satellite URL"
+              required: true
+              type: "text"
+              variable: "satellite_url"
+              default: "https://satellite.prod.spg"
+            - question_name: "Satellite username"
+              required: true
+              type: "text"
+              variable: "satellite_username"
+              default: "admin"
+            - question_name: "Satellite password (leave blank to use env cred)"
+              required: false
+              type: "password"
+              variable: "satellite_password"
+            - question_name: "Template name"
+              required: true
+              type: "text"
+              variable: "template_name"
+              default: "RHEL 9.7 x86_64 Post-Kickstart Default"
+            - question_name: "Template file path"
+              required: true
+              type: "text"
+              variable: "template_file"
+              default: "playbooks/node_provisioning/templates/RHEL_9.7_x86_64_post_kickstart_default.erb"
+            - question_name: "RHEL major version"
+              required: true
+              type: "integer"
+              variable: "os_major"
+              min: 7
+              max: 10
+              default: 9
+            - question_name: "RHEL minor version"
+              required: true
+              type: "integer"
+              variable: "os_minor"
+              min: 0
+              max: 99
+              default: 7
+            - question_name: "Admin user"
+              required: true
+              type: "text"
+              variable: "admin_user"
+              default: "admin"
+            - question_name: "Admin password"
+              required: true
+              type: "password"
+              variable: "admin_password"
+              default: "r3dh4t7!"
+            - question_name: "Activation keys (e.g. 9:RHEL9-AK)"
+              required: true
+              type: "text"
+              variable: "activation_keys"
+              default: "9:RHEL9-AK"
+            - question_name: "Enable package update in %post"
+              required: true
+              type: "multiplechoice"
+              variable: "ks_enable_updates"
+              choices: ["true","false"]
+              default: "true"
+            - question_name: "How many nodes to create?"
+              required: true
+              type: "integer"
+              variable: "node_count"
+              min: 1
+              max: 100
+              default: 5
+            - question_name: "Node name prefix"
+              required: true
+              type: "text"
+              variable: "node_prefix"
+              default: "node"
+            - question_name: "Domain"
+              required: true
+              type: "text"
+              variable: "domain"
+              default: "prod.spg"
+            - question_name: "Sequential mode (extend from highest)"
+              required: true
+              type: "multiplechoice"
+              variable: "sequential_mode"
+              choices: ["true","false"]
+              default: "true"
+            - question_name: "Zero padding (digits)"
+              required: true
+              type: "integer"
+              variable: "number_padding"
+              min: 1
+              max: 6
+              default: 3
+            - question_name: "Build strategy"
+              required: true
+              type: "multiplechoice"
+              variable: "build_strategy"
+              choices: ["linear","free"]
+              default: "linear"
+            - question_name: "Serial batch size (0 = all)"
+              required: true
+              type: "integer"
+              variable: "serial_batch"
+              min: 0
+              max: 500
+              default: 0
+            - question_name: "MAC address prefix"
+              required: true
+              type: "text"
+              variable: "mac_address_prefix"
+              default: "52:54:00:aa:bb"
+            - question_name: "Randomize MAC last octet"
+              required: true
+              type: "multiplechoice"
+              variable: "random_mac"
+              choices: ["true","false"]
+              default: "false"
+            - question_name: "CSV export path (Controller local path)"
+              required: false
+              type: "text"
+              variable: "export_path"
+      tags: workflow
+
+    - name: Ensure workflow nodes exist - Push Template
+      ansible.controller.workflow_job_template_node:
+        controller_host: "{{ controller_host }}"
+        controller_oauthtoken: "{{ _controller_token if _controller_token | length > 0 else omit }}"
+        controller_username: "{{ _controller_username if (_controller_token | length == 0 and _controller_username | length > 0) else omit }}"
+        controller_password: "{{ _controller_password if (_controller_token | length == 0 and _controller_password | length > 0) else omit }}"
+        validate_certs: "{{ controller_verify_ssl }}"
+        workflow_job_template: "{{ workflow_name }}"
+        unified_job_template: "{{ _jt_id_map[jt_push_name] }}"
+        identifier: "push_template"
+        state: present
+      tags: workflow
+
+    - name: Ensure workflow nodes exist - Associate Template to OS
+      ansible.controller.workflow_job_template_node:
+        controller_host: "{{ controller_host }}"
+        controller_oauthtoken: "{{ _controller_token if _controller_token | length > 0 else omit }}"
+        controller_username: "{{ _controller_username if (_controller_token | length == 0 and _controller_username | length > 0) else omit }}"
+        controller_password: "{{ _controller_password if (_controller_token | length == 0 and _controller_password | length > 0) else omit }}"
+        validate_certs: "{{ controller_verify_ssl }}"
+        workflow_job_template: "{{ workflow_name }}"
+        unified_job_template: "{{ _jt_id_map[jt_associate_name] }}"
+        identifier: "associate_os"
+        state: present
+      tags: workflow
+
+    - name: Ensure workflow nodes exist - Set Foreman Parameters
+      ansible.controller.workflow_job_template_node:
+        controller_host: "{{ controller_host }}"
+        controller_oauthtoken: "{{ _controller_token if _controller_token | length > 0 else omit }}"
+        controller_username: "{{ _controller_username if (_controller_token | length == 0 and _controller_username | length > 0) else omit }}"
+        controller_password: "{{ _controller_password if (_controller_token | length == 0 and _controller_password | length > 0) else omit }}"
+        validate_certs: "{{ controller_verify_ssl }}"
+        workflow_job_template: "{{ workflow_name }}"
+        unified_job_template: "{{ _jt_id_map[jt_params_name] }}"
+        identifier: "foreman_params"
+        state: present
+      tags: workflow
+
+    - name: Ensure workflow nodes exist - Bulk Node Builder
+      ansible.controller.workflow_job_template_node:
+        controller_host: "{{ controller_host }}"
+        controller_oauthtoken: "{{ _controller_token if _controller_token | length > 0 else omit }}"
+        controller_username: "{{ _controller_username if (_controller_token | length == 0 and _controller_username | length > 0) else omit }}"
+        controller_password: "{{ _controller_password if (_controller_token | length == 0 and _controller_password | length > 0) else omit }}"
+        validate_certs: "{{ controller_verify_ssl }}"
+        workflow_job_template: "{{ workflow_name }}"
+        unified_job_template: "{{ _jt_id_map[jt_bulk_name] }}"
+        identifier: "bulk_builder"
+        state: present
+      tags: workflow
+
+    - name: Link workflow nodes (success paths)
+      ansible.controller.workflow_job_template_node:
+        controller_host: "{{ controller_host }}"
+        controller_oauthtoken: "{{ _controller_token if _controller_token | length > 0 else omit }}"
+        controller_username: "{{ _controller_username if (_controller_token | length == 0 and _controller_username | length > 0) else omit }}"
+        controller_password: "{{ _controller_password if (_controller_token | length == 0 and _controller_password | length > 0) else omit }}"
+        validate_certs: "{{ controller_verify_ssl }}"
+        workflow_job_template: "{{ workflow_name }}"
+        identifier: "{{ item.identifier }}"
+        success_nodes: "{{ item.success_nodes }}"
+        state: present
+      loop:
+        - { identifier: 'push_template', success_nodes: ['associate_os'] }
+        - { identifier: 'associate_os', success_nodes: ['foreman_params'] }
+        - { identifier: 'foreman_params', success_nodes: ['bulk_builder'] }
+      tags: workflow
 
     - name: Display job template creation results
       ansible.builtin.debug:

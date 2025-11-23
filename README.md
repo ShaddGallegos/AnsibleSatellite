@@ -111,6 +111,77 @@ ansible-playbook playbooks/node_provisioning/satellite_node_manager.yml \
   -e satellite_password="$SATELLITE_PASSWORD"
 ```
 
+## Create AAP job templates (one-shot)
+
+You can auto-create job templates in Ansible Automation Platform (Controller) for the core playbooks in this repository, with Surveys pre-populated to match current defaults. Use the consolidated playbook:
+
+```bash
+ansible-playbook playbooks/ansible_configuration/configure_aap_job_templates.yml \
+  -e controller_host=https://ansible.prod.spg \
+  -e organization_name="Default" \
+  -e project_name="AnsibleSatellite" \
+  -e inventory_name="Satellite Inventory" \
+  -e controller_oauthtoken=$CONTROLLER_OAUTH_TOKEN
+```
+
+Tips
+- Alternatively provide username/password: -e controller_username=admin -e controller_password=... (or set CONTROLLER_USERNAME/CONTROLLER_PASSWORD env vars).
+- Create a local `controller_vars.yml` by copying `playbooks/ansible_configuration/controller_vars.yml.example` and editing values; it will be auto-loaded.
+- Surveys avoid hardcoding secrets. For Satellite/API passwords, prefer Controller Credentials or env vars (e.g., SATELLITE_PASSWORD) at launch time.
+
+Templates created and their Surveys
+- Bulk Node Builder → `playbooks/node_provisioning/bulk_node_builder.yml`
+  - node_count (5), node_prefix (node), domain (prod.spg), sequential_mode (true), number_padding (3), build_strategy (linear|free=linear), serial_batch (0), mac_address_prefix (52:54:00:aa:bb), random_mac (false), satellite_host (satellite.prod.spg), satellite_user (admin), optional satellite_password, os_id (1), hostgroup_id (1), subnet_id (1), location_id (2), organization_id (1), export_path (blank)
+- Push Provisioning Template → `playbooks/node_provisioning/push_provisioning_template.yml`
+  - satellite_url (https://satellite.prod.spg), satellite_username (admin), optional satellite_password, template_name (RHEL 9.7 x86_64 Post-Kickstart Default), template_file (path prefilled)
+- Associate Template to OS → `playbooks/node_provisioning/associate_template_to_os.yml`
+  - satellite_url, satellite_username, optional satellite_password, template_name, os_major (9), os_minor (7)
+- Set Foreman Parameters → `playbooks/node_provisioning/set_foreman_parameters.yml`
+  - satellite_url, satellite_username, optional satellite_password, admin_user (admin), admin_password (r3dh4t7!), activation_keys (9:RHEL9-AK), ks_enable_updates (true)
+- Verify Post Install Summary → `playbooks/node_provisioning/verify_post_install_summary.yml`
+  - target_host, ssh_user (root)
+- PXE Boot Troubleshoot → `playbooks/node_provisioning/pxe_boot_troubleshoot.yml`
+  - vm_name, kvm_uri (qemu:///system)
+- Satellite Configuration Manager → `playbooks/satellite_configuration/satellite_configuration_manager.yml`
+  - operation (compute_profiles|discover_defaults|fix_pxe_templates=compute_profiles), compute_resource_id (1), pxe_bridge (virbr1), pxe_network (internal), subnet_id (1)
+- Satellite Email Notifications → `playbooks/satellite_configuration/satellite_email_notifications.yml`
+  - operation (configure|send|verify=configure), smtp_host (localhost), smtp_port (587), smtp_account (admin@prod.spg), optional smtp_account_password, smtp_use_tls (true), smtp_from_email (admin@prod.spg), smtp_to_emails (admin@prod.spg)
+- Satellite Health Monitoring → `playbooks/satellite_configuration/satellite_health_monitoring.yml`
+  - operation (health_check|backup=health_check), backup_root (/root/satellite-config-backups), backup_retention_days (30)
+- Cleanup Orphaned Disks → `playbooks/libvirt_configuration/cleanup_orphaned_disks.yml`
+  - kvm_host (10.168.0.1), domain_pattern (prod.spg)
+
+### Provisioning pipeline workflow
+
+The same playbook also creates a Workflow Job Template that chains:
+
+1. Push Provisioning Template →
+2. Associate Template to OS →
+3. Set Foreman Parameters →
+4. Bulk Node Builder
+
+Launch the workflow and fill the survey once; the variables are shared across all four steps.
+
+```bash
+ansible-playbook playbooks/ansible_configuration/configure_aap_job_templates.yml \
+  -e controller_host=https://ansible.prod.spg \
+  -e controller_oauthtoken=$CONTROLLER_OAUTH_TOKEN
+```
+
+Workflow name: “Satellite Provisioning Pipeline” (override with -e workflow_name=...)
+
+Workflow survey fields (subset)
+- satellite_url, satellite_username, satellite_password (optional)
+- template_name, template_file
+- os_major, os_minor
+- admin_user, admin_password, activation_keys, ks_enable_updates
+- node_count, node_prefix, domain, sequential_mode, number_padding, build_strategy, serial_batch, mac_address_prefix, random_mac, export_path
+
+Notes
+- All templates are created idempotently. Re-running will update Surveys and settings.
+- Set execution environment, inventory, and credentials via the template playbook variables (see controller_vars example) or edit in the UI post-creation.
+ - If your AAP is fronted by the API Gateway, ensure that the Controller path is reachable (e.g., https://<host>/api/controller/v2/ or https://<host>/api/gateway/v1/automation-controller/v2/). This playbook auto-detects a working endpoint.
+
 ## Core playbooks
 
 Node provisioning (playbooks/node_provisioning)
